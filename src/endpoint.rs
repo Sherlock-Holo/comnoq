@@ -4,11 +4,15 @@ use std::{
     mem::ManuallyDrop,
     net::{SocketAddr, SocketAddrV6},
     pin::pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Instant,
 };
 
+use arc_swap::ArcSwap;
 use compio_buf::{BufResult, bytes::Bytes};
 use compio_log::{Instrument, error};
 #[cfg(rustls)]
@@ -112,7 +116,7 @@ impl EndpointState {
         &mut self,
         handle: ConnectionHandle,
         conn: quinn_proto::Connection,
-        socket: Socket,
+        socket: Arc<Socket>,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
     ) -> Connecting {
         let (tx, rx) = unbounded();
@@ -130,8 +134,9 @@ type ChannelPair<T> = (Sender<T>, Receiver<T>);
 #[derive(Debug)]
 pub(crate) struct EndpointInner {
     state: Mutex<EndpointState>,
-    socket: Socket,
-    ipv6: bool,
+    socket: ArcSwap<Socket>,
+    socket_update_notify: (Sender<()>, Receiver<()>),
+    ipv6: AtomicBool,
     events: ChannelPair<(ConnectionHandle, EndpointEvent)>,
     done: AtomicWaker,
 }
@@ -161,8 +166,9 @@ impl EndpointInner {
                 incoming: VecDeque::new(),
                 incoming_wakers: VecDeque::new(),
             }),
-            socket,
-            ipv6,
+            socket: ArcSwap::new(Arc::new(socket)),
+            socket_update_notify: unbounded(),
+            ipv6: AtomicBool::new(ipv6),
             events: unbounded(),
             done: AtomicWaker::new(),
         })
@@ -179,10 +185,10 @@ impl EndpointInner {
         if state.worker.is_none() {
             return Err(ConnectError::EndpointStopping);
         }
-        if remote.is_ipv6() && !self.ipv6 {
+        if remote.is_ipv6() && !self.ipv6.load(Ordering::Acquire) {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
-        let remote = if self.ipv6 {
+        let remote = if self.ipv6.load(Ordering::Acquire) {
             SocketAddr::V6(match remote {
                 SocketAddr::V4(addr) => {
                     SocketAddrV6::new(addr.ip().to_ipv6_mapped(), addr.port(), 0, 0)
@@ -197,11 +203,16 @@ impl EndpointInner {
             .endpoint
             .connect(Instant::now(), config, remote, server_name)?;
 
-        Ok(state.new_connection(handle, conn, self.socket.clone(), self.events.0.clone()))
+        Ok(state.new_connection(
+            handle,
+            conn,
+            self.socket.load().clone(),
+            self.events.0.clone(),
+        ))
     }
 
     fn respond(&self, buf: Vec<u8>, transmit: Transmit) {
-        let socket = self.socket.clone();
+        let socket = self.socket.load();
         compio_runtime::spawn(async move {
             let _ = socket.send(buf, &transmit).await;
         })
@@ -220,9 +231,12 @@ impl EndpointInner {
             .endpoint
             .accept(incoming, now, &mut resp_buf, server_config.map(Arc::new))
         {
-            Ok((handle, conn)) => {
-                Ok(state.new_connection(handle, conn, self.socket.clone(), self.events.0.clone()))
-            }
+            Ok((handle, conn)) => Ok(state.new_connection(
+                handle,
+                conn,
+                self.socket.load().clone(),
+                self.events.0.clone(),
+            )),
             Err(err) => {
                 if let Some(transmit) = err.response {
                     self.respond(resp_buf, transmit);
@@ -259,20 +273,21 @@ impl EndpointInner {
     async fn run(&self) -> io::Result<()> {
         let respond_fn = |buf: Vec<u8>, transmit: Transmit| self.respond(buf, transmit);
 
-        let mut recv_fut = pin!(
-            self.socket
-                .recv(Vec::with_capacity(
-                    self.state
-                        .lock()
-                        .unwrap()
-                        .endpoint
-                        .config()
-                        .get_max_udp_payload_size()
-                        .min(64 * 1024) as usize
-                        * self.socket.max_gro_segments(),
-                ))
+        let mut recv_fut = pin!({
+            let socket = self.socket.load();
+            let cap = self
+                .state
+                .lock()
+                .unwrap()
+                .endpoint
+                .config()
+                .get_max_udp_payload_size()
+                .min(64 * 1024) as usize
+                * socket.max_gro_segments();
+            async move { socket.recv(Vec::with_capacity(cap)).await }
+                .left_future()
                 .fuse()
-        );
+        });
 
         let mut event_stream = self.events.1.stream().ready_chunks(100);
 
@@ -287,7 +302,10 @@ impl EndpointInner {
                         Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PORT_UNREACHABLE as _) => {}
                         Err(e) => break Err(e),
                     }
-                    recv_fut.set(self.socket.recv(recv_buf).fuse());
+                    let socket = self.socket.load();
+                    recv_fut.set(async move {
+                        socket.recv(recv_buf).await
+                    }.right_future().fuse());
                     state
                 },
                 events = event_stream.select_next_some() => {
@@ -423,7 +441,7 @@ impl Endpoint {
 
     /// Get the local `SocketAddr` the underlying socket is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.socket.local_addr()
+        self.inner.socket.load().local_addr()
     }
 
     /// Get the number of connections that are currently open.
@@ -505,7 +523,38 @@ impl Endpoint {
         })
         .await;
 
-        inner.socket.close().await
+        let socket = inner.socket.into_inner();
+        if let Some(socket) = Arc::into_inner(socket) {
+            socket.close().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Switch to a new UDP socket
+    ///
+    /// Allows the endpoint's address to be updated live, affecting all active
+    /// connections. Incoming connections and connections to servers
+    /// unreachable from the new address will be lost.
+    ///
+    /// On error, the old UDP socket is retained.
+    pub fn rebind(&self, socket: UdpSocket) -> io::Result<()> {
+        let addr = socket.local_addr()?;
+        let socket = Arc::new(Socket::new(socket)?);
+        let state = self.inner.state.lock().unwrap();
+        self.inner.socket.store(socket.clone());
+        self.inner.ipv6.store(addr.is_ipv6(), Ordering::Relaxed);
+
+        // Notify run loop socket is updated
+        self.inner.socket_update_notify.0.send(()).unwrap();
+
+        // Update connection socket references
+        for sender in state.connections.values() {
+            // Ignoring errors from dropped connections
+            let _ = sender.send(ConnectionEvent::Rebind(socket.clone()));
+        }
+
+        Ok(())
     }
 }
 

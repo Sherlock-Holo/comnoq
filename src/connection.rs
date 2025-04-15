@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use compio_buf::{BufResult, bytes::Bytes};
 use compio_log::{Instrument, error};
 use compio_runtime::JoinHandle;
@@ -31,6 +32,7 @@ use crate::{RecvStream, SendStream, Socket};
 pub(crate) enum ConnectionEvent {
     Close(VarInt, Bytes),
     Proto(quinn_proto::ConnectionEvent),
+    Rebind(Arc<Socket>),
 }
 
 #[derive(Debug)]
@@ -114,7 +116,7 @@ fn wake_all_streams(wakers: &mut HashMap<StreamId, Waker>) {
 pub(crate) struct ConnectionInner {
     state: Mutex<ConnectionState>,
     handle: ConnectionHandle,
-    socket: Socket,
+    socket: ArcSwap<Socket>,
     events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
     events_rx: Receiver<ConnectionEvent>,
 }
@@ -129,7 +131,7 @@ impl ConnectionInner {
     fn new(
         handle: ConnectionHandle,
         conn: quinn_proto::Connection,
-        socket: Socket,
+        socket: Arc<Socket>,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
         events_rx: Receiver<ConnectionEvent>,
     ) -> Self {
@@ -151,7 +153,7 @@ impl ConnectionInner {
                 stopped: HashMap::default(),
             }),
             handle,
-            socket,
+            socket: ArcSwap::new(socket),
             events_tx,
             events_rx,
         }
@@ -208,6 +210,7 @@ impl ConnectionInner {
                         match event {
                             ConnectionEvent::Close(error_code, reason) => state.close(error_code, reason),
                             ConnectionEvent::Proto(event) => state.conn.handle_event(event),
+                            ConnectionEvent::Rebind(socket) => self.socket.store(socket),
                         }
                     }
                     state
@@ -224,12 +227,13 @@ impl ConnectionInner {
             };
 
             if let Some(mut buf) = send_buf.take() {
-                if let Some(transmit) = state.conn.poll_transmit(
-                    Instant::now(),
-                    self.socket.max_gso_segments(),
-                    &mut buf,
-                ) {
-                    transmit_fut.set(async move { self.socket.send(buf, &transmit).await }.fuse())
+                let socket = self.socket.load();
+                if let Some(transmit) =
+                    state
+                        .conn
+                        .poll_transmit(Instant::now(), socket.max_gso_segments(), &mut buf)
+                {
+                    transmit_fut.set(async move { socket.send(buf, &transmit).await }.fuse())
                 } else {
                     send_buf = Some(buf);
                 }
@@ -374,7 +378,7 @@ impl Connecting {
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: quinn_proto::Connection,
-        socket: Socket,
+        socket: Arc<Socket>,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
         events_rx: Receiver<ConnectionEvent>,
     ) -> Self {

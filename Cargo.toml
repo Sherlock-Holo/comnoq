@@ -22,6 +22,7 @@ compio-log = { workspace = true }
 compio-net = { workspace = true }
 compio-runtime = { workspace = true, features = ["time"] }
 
+arc-swap = "1.7.1"
 quinn-proto = { version = "0.11.10", default-features = false }
 rustls = { workspace = true }
 rustls-platform-verifier = { version = "0.5.0", optional = true }
