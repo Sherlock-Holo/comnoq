@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fmt::Debug,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     pin::{Pin, pin},
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
@@ -10,7 +10,7 @@ use std::{
 use compio_buf::bytes::Bytes;
 use compio_log::Instrument;
 use compio_runtime::JoinHandle;
-use flume::{Receiver, Sender};
+use flume::{Receiver, Sender, unbounded};
 use futures_util::{
     FutureExt, StreamExt,
     future::{self, Fuse, FusedFuture, LocalBoxFuture},
@@ -19,14 +19,15 @@ use futures_util::{
 #[cfg(rustls)]
 use noq_proto::crypto::rustls::HandshakeData;
 use noq_proto::{
-    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, PathId, Side, StreamEvent, StreamId,
-    VarInt, congestion::Controller,
+    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, FourTuple, PathError, PathEvent, PathId,
+    PathStats, PathStatus, Side, StreamEvent, StreamId, VarInt, congestion::Controller,
+    n0_nat_traversal,
 };
 use rustc_hash::FxHashMap as HashMap;
 use thiserror::Error;
 
 use crate::{
-    RecvStream, SendStream, Socket,
+    OpenPath, Path, RecvStream, SendStream, Socket,
     sync::{
         mutex_blocking::{Mutex, MutexGuard},
         shared::Shared,
@@ -44,14 +45,21 @@ pub(crate) struct ConnectionState {
     pub(crate) conn: noq_proto::Connection,
     pub(crate) error: Option<ConnectionError>,
     connected: bool,
+    handshake_confirmed: bool,
     worker: Option<JoinHandle<()>>,
     poller: Option<Waker>,
     on_connected: Option<Waker>,
     on_handshake_data: Option<Waker>,
+    on_handshake_confirmed: VecDeque<Waker>,
     datagram_received: VecDeque<Waker>,
     datagrams_unblocked: VecDeque<Waker>,
     stream_opened: [VecDeque<Waker>; 2],
     stream_available: [VecDeque<Waker>; 2],
+    open_path: HashMap<PathId, Sender<Result<(), PathError>>>,
+    path_events: Vec<Sender<PathEvent>>,
+    observed_external_addr: Option<SocketAddr>,
+    nat_traversal_updates: Vec<Sender<n0_nat_traversal::Event>>,
+    final_path_stats: HashMap<PathId, PathStats>,
     pub(crate) writable: HashMap<StreamId, Waker>,
     pub(crate) readable: HashMap<StreamId, Waker>,
     pub(crate) stopped: HashMap<StreamId, Waker>,
@@ -68,6 +76,7 @@ impl ConnectionState {
         if let Some(waker) = self.on_connected.take() {
             waker.wake()
         }
+        self.on_handshake_confirmed.drain(..).for_each(Waker::wake);
         self.datagram_received.drain(..).for_each(Waker::wake);
         self.datagrams_unblocked.drain(..).for_each(Waker::wake);
         for e in &mut self.stream_opened {
@@ -75,6 +84,9 @@ impl ConnectionState {
         }
         for e in &mut self.stream_available {
             e.drain(..).for_each(Waker::wake);
+        }
+        for tx in self.open_path.drain().map(|(_, tx)| tx) {
+            let _ = tx.send(Err(PathError::ValidationFailed));
         }
         wake_all_streams(&mut self.writable);
         wake_all_streams(&mut self.readable);
@@ -104,6 +116,12 @@ impl ConnectionState {
     pub(crate) fn check_0rtt(&self) -> bool {
         self.conn.side().is_server() || self.conn.is_handshaking() || self.conn.accepted_0rtt()
     }
+
+    pub(crate) fn path_stats(&mut self, path_id: PathId) -> Option<PathStats> {
+        self.conn
+            .path_stats(path_id)
+            .or_else(|| self.final_path_stats.get(&path_id).copied())
+    }
 }
 
 fn wake_stream(stream: StreamId, wakers: &mut HashMap<StreamId, Waker>) {
@@ -114,6 +132,41 @@ fn wake_stream(stream: StreamId, wakers: &mut HashMap<StreamId, Waker>) {
 
 fn wake_all_streams(wakers: &mut HashMap<StreamId, Waker>) {
     wakers.drain().for_each(|(_, waker)| waker.wake())
+}
+
+fn wake_waiters(wakers: &mut VecDeque<Waker>) {
+    wakers.drain(..).for_each(Waker::wake)
+}
+
+fn broadcast<T: Clone>(listeners: &mut Vec<Sender<T>>, event: T) {
+    listeners.retain(|tx| tx.send(event.clone()).is_ok());
+}
+
+fn normalize_remote_address(
+    state: &ConnectionState,
+    addr: SocketAddr,
+) -> Result<SocketAddr, PathError> {
+    let ipv6 = state
+        .conn
+        .paths()
+        .iter()
+        .filter_map(|id| state.conn.network_path(*id).ok())
+        .map(|path| path.remote.is_ipv6())
+        .next()
+        .unwrap_or_default();
+    if addr.is_ipv6() && !ipv6 {
+        return Err(PathError::InvalidRemoteAddress(addr));
+    }
+    Ok(if ipv6 {
+        SocketAddr::V6(match addr {
+            SocketAddr::V4(addr) => {
+                SocketAddrV6::new(addr.ip().to_ipv6_mapped(), addr.port(), 0, 0)
+            }
+            SocketAddr::V6(addr) => addr,
+        })
+    } else {
+        addr
+    })
 }
 
 #[derive(Debug)]
@@ -143,15 +196,22 @@ impl ConnectionInner {
             state: Mutex::new(ConnectionState {
                 conn,
                 connected: false,
+                handshake_confirmed: false,
                 error: None,
                 worker: None,
                 poller: None,
                 on_connected: None,
                 on_handshake_data: None,
+                on_handshake_confirmed: VecDeque::new(),
                 datagram_received: VecDeque::new(),
                 datagrams_unblocked: VecDeque::new(),
                 stream_opened: [VecDeque::new(), VecDeque::new()],
                 stream_available: [VecDeque::new(), VecDeque::new()],
+                open_path: HashMap::default(),
+                path_events: Vec::new(),
+                observed_external_addr: None,
+                nat_traversal_updates: Vec::new(),
+                final_path_stats: HashMap::default(),
                 writable: HashMap::default(),
                 readable: HashMap::default(),
                 stopped: HashMap::default(),
@@ -284,13 +344,33 @@ impl ConnectionInner {
                     DatagramsUnblocked => state.datagrams_unblocked.drain(..).for_each(Waker::wake),
 
                     HandshakeConfirmed => {
-                        todo!()
+                        state.handshake_confirmed = true;
+                        wake_waiters(&mut state.on_handshake_confirmed);
                     }
-                    Path(_) => {
-                        todo!()
+                    Path(event) => {
+                        match &event {
+                            PathEvent::ObservedAddr { addr, .. } => {
+                                state.observed_external_addr = Some(*addr);
+                            }
+                            PathEvent::Opened { id } => {
+                                if let Some(tx) = state.open_path.remove(id) {
+                                    let _ = tx.send(Ok(()));
+                                }
+                            }
+                            PathEvent::Abandoned { id, .. } => {
+                                if let Some(tx) = state.open_path.remove(id) {
+                                    let _ = tx.send(Err(PathError::ValidationFailed));
+                                }
+                            }
+                            PathEvent::Discarded { id, path_stats } => {
+                                state.final_path_stats.insert(*id, *path_stats);
+                            }
+                            PathEvent::RemoteStatus { .. } => {}
+                        }
+                        broadcast(&mut state.path_events, event);
                     }
-                    NatTraversal(_) => {
-                        todo!()
+                    NatTraversal(event) => {
+                        broadcast(&mut state.nat_traversal_updates, event);
                     }
                 }
             }
@@ -674,6 +754,25 @@ impl Connection {
             .close(error_code, Bytes::copy_from_slice(reason));
     }
 
+    /// Wait for the TLS handshake to be confirmed.
+    pub async fn handshake_confirmed(&self) -> Result<(), ConnectionError> {
+        future::poll_fn(|cx| {
+            let mut state = self.0.try_state()?;
+            if state.handshake_confirmed {
+                return Poll::Ready(Ok(()));
+            }
+            if !state
+                .on_handshake_confirmed
+                .iter()
+                .any(|waker| waker.will_wake(cx.waker()))
+            {
+                state.on_handshake_confirmed.push_back(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
     /// Wait for the connection to be closed for any reason.
     pub async fn closed(&self) -> ConnectionError {
         let worker = self.0.state().worker.take();
@@ -689,6 +788,111 @@ impl Connection {
     /// Returns `None` if the connection is still open.
     pub fn close_reason(&self) -> Option<ConnectionError> {
         self.0.try_state().err()
+    }
+
+    /// Opens an additional path if multipath is negotiated.
+    pub fn open_path(&self, addr: SocketAddr, initial_status: PathStatus) -> OpenPath {
+        let mut state = self.0.state();
+        let addr = match normalize_remote_address(&state, addr) {
+            Ok(addr) => addr,
+            Err(err) => return OpenPath::rejected(err),
+        };
+        let (tx, rx) = flume::bounded(1);
+        let result = state.conn.open_path(
+            FourTuple {
+                remote: addr,
+                local_ip: None,
+            },
+            initial_status,
+            Instant::now(),
+        );
+        match result {
+            Ok(path_id) => {
+                state.open_path.insert(path_id, tx);
+                state.wake();
+                OpenPath::new(path_id, rx, self.0.clone())
+            }
+            Err(err) => OpenPath::rejected(err),
+        }
+    }
+
+    /// Returns the path handle for an open path.
+    pub fn path(&self, id: PathId) -> Option<Path> {
+        Path::new(&self.0, id)
+    }
+
+    /// Subscribe to path events for this connection.
+    pub fn path_events(&self) -> Receiver<PathEvent> {
+        let (tx, rx) = unbounded();
+        self.0.state().path_events.push(tx);
+        rx
+    }
+
+    /// Subscribe to NAT traversal updates for this connection.
+    pub fn nat_traversal_updates(&self) -> Receiver<n0_nat_traversal::Event> {
+        let (tx, rx) = unbounded();
+        self.0.state().nat_traversal_updates.push(tx);
+        rx
+    }
+
+    /// The latest external address observed by the peer.
+    pub fn observed_external_addr(&self) -> Option<SocketAddr> {
+        self.0.state().observed_external_addr
+    }
+
+    /// Statistics for a specific path.
+    pub fn path_stats(&self, path_id: PathId) -> Option<PathStats> {
+        self.0.state().path_stats(path_id)
+    }
+
+    /// Whether the multipath extension was negotiated for this connection.
+    pub fn is_multipath_enabled(&self) -> bool {
+        self.0.state().conn.is_multipath_negotiated()
+    }
+
+    /// Registers a local address for the NAT traversal extension.
+    pub fn add_nat_traversal_address(
+        &self,
+        address: SocketAddr,
+    ) -> Result<(), n0_nat_traversal::Error> {
+        let mut state = self.0.state();
+        state.conn.add_nat_traversal_address(address)?;
+        state.wake();
+        Ok(())
+    }
+
+    /// Removes a local address from the NAT traversal extension set.
+    pub fn remove_nat_traversal_address(
+        &self,
+        address: SocketAddr,
+    ) -> Result<(), n0_nat_traversal::Error> {
+        let mut state = self.0.state();
+        state.conn.remove_nat_traversal_address(address)?;
+        state.wake();
+        Ok(())
+    }
+
+    /// Returns the local NAT traversal addresses known to this connection.
+    pub fn get_local_nat_traversal_addresses(
+        &self,
+    ) -> Result<Vec<SocketAddr>, n0_nat_traversal::Error> {
+        self.0.state().conn.get_local_nat_traversal_addresses()
+    }
+
+    /// Returns the remote NAT traversal addresses known to this connection.
+    pub fn get_remote_nat_traversal_addresses(
+        &self,
+    ) -> Result<Vec<SocketAddr>, n0_nat_traversal::Error> {
+        self.0.state().conn.get_remote_nat_traversal_addresses()
+    }
+
+    /// Initiates a NAT traversal round and returns the candidate addresses
+    /// being probed.
+    pub fn initiate_nat_traversal_round(&self) -> Result<Vec<SocketAddr>, n0_nat_traversal::Error> {
+        let mut state = self.0.state();
+        let addresses = state.conn.initiate_nat_traversal_round(Instant::now())?;
+        state.wake();
+        Ok(addresses)
     }
 
     fn poll_recv_datagram(&self, cx: &mut Context) -> Poll<Result<Bytes, ConnectionError>> {

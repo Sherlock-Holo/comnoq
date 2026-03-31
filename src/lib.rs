@@ -14,13 +14,14 @@
 )]
 
 pub use noq_proto::{
-    AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
-    ConnectError, ConnectionClose, ConnectionId, ConnectionIdGenerator, ConnectionStats, Dir,
-    EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout, MtuDiscoveryConfig,
-    NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side, StdSystemTime, StreamId,
-    TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit, TransportConfig,
-    TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt, VarIntBoundsExceeded, Written,
-    congestion, crypto,
+    AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosePathError, ClosedPath,
+    ClosedStream, ConfigError, ConnectError, ConnectionClose, ConnectionId, ConnectionIdGenerator,
+    ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
+    MtuDiscoveryConfig, MultipathNotNegotiated, NoneTokenLog, NoneTokenStore, PathAbandonReason,
+    PathError, PathEvent, PathId, PathStats, PathStatus, ServerConfig, SetPathStatusError, Side,
+    StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore,
+    Transmit, TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
+    VarIntBoundsExceeded, Written, congestion, crypto, n0_nat_traversal,
 };
 #[cfg(feature = "qlog")]
 pub use noq_proto::{QlogConfig, QlogStream};
@@ -30,6 +31,7 @@ mod builder;
 mod connection;
 mod endpoint;
 mod incoming;
+mod path;
 mod recv_stream;
 mod send_stream;
 mod socket;
@@ -39,6 +41,7 @@ pub use builder::{ClientBuilder, ServerBuilder};
 pub use connection::{Connecting, Connection, ConnectionError, OpenStreamError, SendDatagramError};
 pub use endpoint::{Endpoint, EndpointStats};
 pub use incoming::{Incoming, IncomingFuture};
+pub use path::{OpenPath, Path};
 pub use recv_stream::{ReadError, ReadExactError, RecvStream, ResetError};
 pub use send_stream::{SendStream, StoppedError, WriteError};
 #[cfg(feature = "sync")]
