@@ -13,7 +13,7 @@
     html_favicon_url = "https://github.com/compio-rs/compio-logo/raw/refs/heads/master/generated/colored-bold.svg"
 )]
 
-pub use quinn_proto::{
+pub use noq_proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
     ConnectError, ConnectionClose, ConnectionId, ConnectionIdGenerator, ConnectionStats, Dir,
     EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout, MtuDiscoveryConfig,
@@ -23,7 +23,7 @@ pub use quinn_proto::{
     congestion, crypto,
 };
 #[cfg(feature = "qlog")]
-pub use quinn_proto::{QlogConfig, QlogStream};
+pub use noq_proto::{QlogConfig, QlogStream};
 
 #[cfg(rustls)]
 mod builder;

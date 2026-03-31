@@ -1,7 +1,7 @@
 use std::{io, sync::Arc};
 
 use compio_net::ToSocketAddrsAsync;
-use quinn_proto::{
+use noq_proto::{
     ClientConfig, ServerConfig,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };

@@ -12,13 +12,14 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
     sync::atomic::Ordering,
 };
 
 use compio_buf::{BufResult, IntoInner, IoBuf, IoBufMut, buf_try};
 use compio_io::ancillary::{AncillaryBuf, AncillaryIter, CodecError};
 use compio_net::UdpSocket;
-use quinn_proto::{EcnCodepoint, Transmit};
+use noq_proto::{EcnCodepoint, Transmit};
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock;
 
@@ -122,7 +123,7 @@ macro_rules! set_socket_option {
 pub(crate) struct Socket {
     inner: UdpSocket,
     max_gro_segments: usize,
-    max_gso_segments: usize,
+    max_gso_segments: NonZeroUsize,
     may_fragment: bool,
     has_gso_error: AtomicBool,
     #[cfg(freebsd)]
@@ -238,7 +239,8 @@ impl Socket {
         }
 
         // GSO
-        let max_gso_segments = max_gso_segments(&socket).unwrap_or(1);
+        let max_gso_segments = NonZeroUsize::new(max_gso_segments(&socket).unwrap_or(1))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "max_gso_segments is 0"))?;
 
         #[cfg(freebsd)]
         let encode_src_ip_v4 =
@@ -271,9 +273,9 @@ impl Socket {
     }
 
     #[inline]
-    pub fn max_gso_segments(&self) -> usize {
+    pub fn max_gso_segments(&self) -> NonZeroUsize {
         if self.has_gso_error.load(Ordering::Relaxed) {
-            1
+            NonZeroUsize::new(1).unwrap()
         } else {
             self.max_gso_segments
         }
@@ -505,7 +507,7 @@ impl Socket {
                     _ => {
                         #[cfg(linux_all)]
                         if matches!(e.raw_os_error(), Some(libc::EIO) | Some(libc::EINVAL))
-                            && self.max_gso_segments() > 1
+                            && self.max_gso_segments().get() > 1
                         {
                             self.has_gso_error.store(true, Ordering::Relaxed);
                         }
@@ -722,7 +724,7 @@ mod tests {
         let passive = Socket::new(UdpSocket::bind("[::1]:0").await.unwrap()).unwrap();
         let active = Socket::new(UdpSocket::bind("[::1]:0").await.unwrap()).unwrap();
 
-        let max_segments = active.max_gso_segments();
+        let max_segments = active.max_gso_segments().get();
         const SEGMENT_SIZE: usize = 128;
         let content = vec![0xAB; SEGMENT_SIZE * max_segments];
 

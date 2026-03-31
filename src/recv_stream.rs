@@ -7,7 +7,7 @@ use std::{
 use compio_buf::{BufResult, IoBufMut, bytes::Bytes};
 use compio_io::AsyncRead;
 use futures_util::future::poll_fn;
-use quinn_proto::{Chunk, Chunks, ClosedStream, ReadableError, StreamId, VarInt};
+use noq_proto::{Chunk, Chunks, ClosedStream, ReadableError, StreamId, VarInt};
 use thiserror::Error;
 
 use crate::{ConnectionError, ConnectionInner, sync::shared::Shared};
@@ -159,7 +159,7 @@ impl RecvStream {
     where
         F: FnMut(&mut Chunks) -> ReadStatus<T>,
     {
-        use quinn_proto::ReadError::*;
+        use noq_proto::ReadError::*;
 
         if self.all_data_read {
             return Poll::Ready(Ok(None));
@@ -413,11 +413,11 @@ impl Drop for RecvStream {
 enum ReadStatus<T> {
     Readable(T),
     Finished(Option<T>),
-    Failed(Option<T>, quinn_proto::ReadError),
+    Failed(Option<T>, noq_proto::ReadError),
 }
 
-impl<T> From<(Option<T>, Option<quinn_proto::ReadError>)> for ReadStatus<T> {
-    fn from(status: (Option<T>, Option<quinn_proto::ReadError>)) -> Self {
+impl<T> From<(Option<T>, Option<noq_proto::ReadError>)> for ReadStatus<T> {
+    fn from(status: (Option<T>, Option<noq_proto::ReadError>)) -> Self {
         match status {
             (read, None) => Self::Finished(read),
             (read, Some(e)) => Self::Failed(read, e),

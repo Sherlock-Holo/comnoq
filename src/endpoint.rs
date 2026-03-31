@@ -21,9 +21,9 @@ use compio_net::UdpSocket;
 use compio_runtime::JoinHandle;
 use flume::{Receiver, Sender, unbounded};
 use futures_util::{FutureExt, StreamExt, future, select, task::AtomicWaker};
-use quinn_proto::{
+use noq_proto::{
     ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointConfig,
-    EndpointEvent, ServerConfig, Transmit, VarInt,
+    EndpointEvent, FourTuple, ServerConfig, Transmit, VarInt,
 };
 use rustc_hash::FxHashMap as HashMap;
 
@@ -34,12 +34,12 @@ use crate::{
 
 #[derive(Debug)]
 struct EndpointState {
-    endpoint: quinn_proto::Endpoint,
+    endpoint: noq_proto::Endpoint,
     worker: Option<JoinHandle<()>>,
     connections: HashMap<ConnectionHandle, Sender<ConnectionEvent>>,
     close: Option<(VarInt, Bytes)>,
     exit_on_idle: bool,
-    incoming: VecDeque<quinn_proto::Incoming>,
+    incoming: VecDeque<noq_proto::Incoming>,
     incoming_wakers: VecDeque<Waker>,
     stats: EndpointStats,
 }
@@ -68,8 +68,10 @@ impl EndpointState {
             let mut resp_buf = Vec::new();
             match self.endpoint.handle(
                 now,
-                meta.remote,
-                meta.local_ip,
+                FourTuple {
+                    remote: meta.remote,
+                    local_ip: meta.local_ip,
+                },
                 meta.ecn,
                 data,
                 &mut resp_buf,
@@ -112,7 +114,7 @@ impl EndpointState {
         self.connections.is_empty()
     }
 
-    fn poll_incoming(&mut self, cx: &mut Context) -> Poll<Option<quinn_proto::Incoming>> {
+    fn poll_incoming(&mut self, cx: &mut Context) -> Poll<Option<noq_proto::Incoming>> {
         if self.close.is_none() {
             if let Some(incoming) = self.incoming.pop_front() {
                 Poll::Ready(Some(incoming))
@@ -128,7 +130,7 @@ impl EndpointState {
     fn new_connection(
         &mut self,
         handle: ConnectionHandle,
-        conn: quinn_proto::Connection,
+        conn: noq_proto::Connection,
         socket: Socket,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
     ) -> Connecting {
@@ -173,11 +175,10 @@ impl EndpointInner {
 
         Ok(Self {
             state: Mutex::new(EndpointState {
-                endpoint: quinn_proto::Endpoint::new(
+                endpoint: noq_proto::Endpoint::new(
                     Arc::new(config),
                     server_config.map(Arc::new),
                     allow_mtud,
-                    None,
                 ),
                 worker: None,
                 connections: HashMap::default(),
@@ -237,7 +238,7 @@ impl EndpointInner {
 
     pub(crate) fn accept(
         &self,
-        incoming: quinn_proto::Incoming,
+        incoming: noq_proto::Incoming,
         server_config: Option<ServerConfig>,
     ) -> Result<Connecting, ConnectionError> {
         let mut state = self.state.lock();
@@ -260,7 +261,7 @@ impl EndpointInner {
         }
     }
 
-    pub(crate) fn refuse(&self, incoming: quinn_proto::Incoming) {
+    pub(crate) fn refuse(&self, incoming: noq_proto::Incoming) {
         let mut state = self.state.lock();
         state.stats.refused_handshakes += 1;
         let mut resp_buf = Vec::new();
@@ -269,10 +270,7 @@ impl EndpointInner {
     }
 
     #[allow(clippy::result_large_err)]
-    pub(crate) fn retry(
-        &self,
-        incoming: quinn_proto::Incoming,
-    ) -> Result<(), quinn_proto::RetryError> {
+    pub(crate) fn retry(&self, incoming: noq_proto::Incoming) -> Result<(), noq_proto::RetryError> {
         let mut state = self.state.lock();
         let mut resp_buf = Vec::new();
         let transmit = state.endpoint.retry(incoming, &mut resp_buf)?;
@@ -280,7 +278,7 @@ impl EndpointInner {
         Ok(())
     }
 
-    pub(crate) fn ignore(&self, incoming: quinn_proto::Incoming) {
+    pub(crate) fn ignore(&self, incoming: noq_proto::Incoming) {
         let mut state = self.state.lock();
         state.stats.ignored_handshakes += 1;
         state.endpoint.ignore(incoming);

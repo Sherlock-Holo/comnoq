@@ -17,10 +17,10 @@ use futures_util::{
     select, stream,
 };
 #[cfg(rustls)]
-use quinn_proto::crypto::rustls::HandshakeData;
-use quinn_proto::{
-    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, Side, StreamEvent, StreamId, VarInt,
-    congestion::Controller,
+use noq_proto::crypto::rustls::HandshakeData;
+use noq_proto::{
+    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, PathId, Side, StreamEvent, StreamId,
+    VarInt, congestion::Controller,
 };
 use rustc_hash::FxHashMap as HashMap;
 use thiserror::Error;
@@ -36,12 +36,12 @@ use crate::{
 #[derive(Debug)]
 pub(crate) enum ConnectionEvent {
     Close(VarInt, Bytes),
-    Proto(quinn_proto::ConnectionEvent),
+    Proto(noq_proto::ConnectionEvent),
 }
 
 #[derive(Debug)]
 pub(crate) struct ConnectionState {
-    pub(crate) conn: quinn_proto::Connection,
+    pub(crate) conn: noq_proto::Connection,
     pub(crate) error: Option<ConnectionError>,
     connected: bool,
     worker: Option<JoinHandle<()>>,
@@ -134,7 +134,7 @@ fn implicit_close(this: &Shared<ConnectionInner>) {
 impl ConnectionInner {
     fn new(
         handle: ConnectionHandle,
-        conn: quinn_proto::Connection,
+        conn: noq_proto::Connection,
         socket: Socket,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
         events_rx: Receiver<ConnectionEvent>,
@@ -246,7 +246,7 @@ impl ConnectionInner {
             }
 
             while let Some(event) = state.conn.poll() {
-                use quinn_proto::Event::*;
+                use noq_proto::Event::*;
                 match event {
                     HandshakeDataReady => {
                         if let Some(waker) = state.on_handshake_data.take() {
@@ -282,6 +282,16 @@ impl ConnectionInner {
                         .for_each(Waker::wake),
                     DatagramReceived => state.datagram_received.drain(..).for_each(Waker::wake),
                     DatagramsUnblocked => state.datagrams_unblocked.drain(..).for_each(Waker::wake),
+
+                    HandshakeConfirmed => {
+                        todo!()
+                    }
+                    Path(_) => {
+                        todo!()
+                    }
+                    NatTraversal(_) => {
+                        todo!()
+                    }
                 }
             }
 
@@ -313,19 +323,37 @@ macro_rules! conn_fn {
         /// This will return `None` for clients, or when the platform does not
         /// expose this information.
         pub fn local_ip(&self) -> Option<IpAddr> {
-            self.0.state().conn.local_ip()
+            let state = self.0.state();
+
+            state
+                .conn
+                .paths()
+                .iter()
+                .filter_map(|id| state.conn.network_path(*id).ok())
+                .next()
+                .unwrap()
+                .local_ip
         }
 
         /// The peer's UDP address.
         ///
         /// Will panic if called after `poll` has returned `Ready`.
         pub fn remote_address(&self) -> SocketAddr {
-            self.0.state().conn.remote_address()
+            let state = self.0.state();
+
+            state
+                .conn
+                .paths()
+                .iter()
+                .filter_map(|id| state.conn.network_path(*id).ok())
+                .next()
+                .unwrap()
+                .remote
         }
 
         /// Current best estimate of this connection's latency (round-trip-time).
-        pub fn rtt(&self) -> Duration {
-            self.0.state().conn.rtt()
+        pub fn rtt(&self, path_id: PathId) -> Option<Duration> {
+            self.0.state().conn.rtt(path_id)
         }
 
         /// Connection statistics.
@@ -335,8 +363,12 @@ macro_rules! conn_fn {
 
         /// Current state of the congestion control algorithm. (For debugging
         /// purposes)
-        pub fn congestion_state(&self) -> Box<dyn Controller> {
-            self.0.state().conn.congestion_state().clone_box()
+        pub fn congestion_state(&self, path_id: PathId) -> Option<Box<dyn Controller>> {
+            self.0
+                .state()
+                .conn
+                .congestion_state(path_id)
+                .map(|state| state.clone_box())
         }
 
         /// Cryptographic identity of the peer.
@@ -375,7 +407,7 @@ macro_rules! conn_fn {
             output: &mut [u8],
             label: &[u8],
             context: &[u8],
-        ) -> Result<(), quinn_proto::crypto::ExportKeyingMaterialError> {
+        ) -> Result<(), noq_proto::crypto::ExportKeyingMaterialError> {
             self.0
                 .state()
                 .conn
@@ -395,7 +427,7 @@ impl Connecting {
 
     pub(crate) fn new(
         handle: ConnectionHandle,
-        conn: quinn_proto::Connection,
+        conn: noq_proto::Connection,
         socket: Socket,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
         events_rx: Receiver<ConnectionEvent>,
@@ -573,14 +605,14 @@ impl Connection {
         state.wake();
     }
 
-    /// See [`quinn_proto::TransportConfig::send_window()`]
+    /// See [`noq_proto::TransportConfig::send_window()`]
     pub fn set_send_window(&self, send_window: u64) {
         let mut state = self.0.state();
         state.conn.set_send_window(send_window);
         state.wake();
     }
 
-    /// See [`quinn_proto::TransportConfig::receive_window()`]
+    /// See [`noq_proto::TransportConfig::receive_window()`]
     pub fn set_receive_window(&self, receive_window: VarInt) {
         let mut state = self.0.state();
         state.conn.set_receive_window(receive_window);
@@ -685,7 +717,7 @@ impl Connection {
         cx: Option<&mut Context>,
         data: Bytes,
     ) -> Result<(), Result<SendDatagramError, Bytes>> {
-        use quinn_proto::SendDatagramError::*;
+        use noq_proto::SendDatagramError::*;
         let mut state = self.0.try_state().map_err(|e| Ok(e.into()))?;
         state
             .conn
@@ -945,13 +977,13 @@ pub enum ConnectionError {
     /// The peer violated the QUIC specification as understood by this
     /// implementation
     #[error(transparent)]
-    TransportError(#[from] quinn_proto::TransportError),
+    TransportError(#[from] noq_proto::TransportError),
     /// The peer's QUIC stack aborted the connection automatically
     #[error("aborted by peer: {0}")]
-    ConnectionClosed(quinn_proto::ConnectionClose),
+    ConnectionClosed(noq_proto::ConnectionClose),
     /// The peer closed the connection
     #[error("closed by peer: {0}")]
-    ApplicationClosed(quinn_proto::ApplicationClose),
+    ApplicationClosed(noq_proto::ApplicationClose),
     /// The peer is unable to continue processing this connection, usually due
     /// to having restarted
     #[error("reset by peer")]
@@ -961,8 +993,8 @@ pub enum ConnectionError {
     ///
     /// If neither side is sending keep-alives, a connection will time out after
     /// a long enough idle period even if the peer is still reachable. See
-    /// also [`TransportConfig::max_idle_timeout()`](quinn_proto::TransportConfig::max_idle_timeout())
-    /// and [`TransportConfig::keep_alive_interval()`](quinn_proto::TransportConfig::keep_alive_interval()).
+    /// also [`TransportConfig::max_idle_timeout()`](noq_proto::TransportConfig::max_idle_timeout())
+    /// and [`TransportConfig::keep_alive_interval()`](noq_proto::TransportConfig::keep_alive_interval()).
     #[error("timed out")]
     TimedOut,
     /// The local application closed the connection
@@ -976,9 +1008,9 @@ pub enum ConnectionError {
     CidsExhausted,
 }
 
-impl From<quinn_proto::ConnectionError> for ConnectionError {
-    fn from(value: quinn_proto::ConnectionError) -> Self {
-        use quinn_proto::ConnectionError::*;
+impl From<noq_proto::ConnectionError> for ConnectionError {
+    fn from(value: noq_proto::ConnectionError) -> Self {
+        use noq_proto::ConnectionError::*;
 
         match value {
             VersionMismatch => ConnectionError::VersionMismatch,

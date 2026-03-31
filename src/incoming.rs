@@ -6,14 +6,14 @@ use std::{
 };
 
 use futures_util::FutureExt;
-use quinn_proto::{ConnectionId, ServerConfig};
+use noq_proto::{ConnectionId, ServerConfig};
 use thiserror::Error;
 
 use crate::{Connecting, Connection, ConnectionError, EndpointRef};
 
 #[derive(Debug)]
 pub(crate) struct IncomingInner {
-    pub(crate) incoming: quinn_proto::Incoming,
+    pub(crate) incoming: noq_proto::Incoming,
     pub(crate) endpoint: EndpointRef,
 }
 
@@ -23,7 +23,7 @@ pub(crate) struct IncomingInner {
 pub struct Incoming(Option<IncomingInner>);
 
 impl Incoming {
-    pub(crate) fn new(incoming: quinn_proto::Incoming, endpoint: EndpointRef) -> Self {
+    pub(crate) fn new(incoming: noq_proto::Incoming, endpoint: EndpointRef) -> Self {
         Self(Some(IncomingInner { incoming, endpoint }))
     }
 
@@ -103,7 +103,7 @@ impl Incoming {
 
     /// The original destination CID when initiating the connection
     pub fn orig_dst_cid(&self) -> ConnectionId {
-        *self.0.as_ref().unwrap().incoming.orig_dst_cid()
+        self.0.as_ref().unwrap().incoming.orig_dst_cid()
     }
 }
 

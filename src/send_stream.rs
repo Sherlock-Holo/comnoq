@@ -6,7 +6,7 @@ use std::{
 use compio_buf::{BufResult, IoBuf, bytes::Bytes};
 use compio_io::AsyncWrite;
 use futures_util::{future::poll_fn, ready};
-use quinn_proto::{ClosedStream, FinishError, StreamId, VarInt, Written};
+use noq_proto::{ClosedStream, FinishError, StreamId, VarInt, Written};
 use thiserror::Error;
 
 use crate::{ConnectionError, ConnectionInner, sync::shared::Shared};
@@ -157,7 +157,7 @@ impl SendStream {
 
     fn execute_poll_write<F, R>(&mut self, cx: &mut Context, f: F) -> Poll<Result<R, WriteError>>
     where
-        F: FnOnce(quinn_proto::SendStream) -> Result<R, quinn_proto::WriteError>,
+        F: FnOnce(noq_proto::SendStream) -> Result<R, noq_proto::WriteError>,
     {
         let mut state = self.conn.try_state()?;
         if self.is_0rtt && !state.check_0rtt() {
@@ -268,11 +268,11 @@ pub enum WriteError {
     NotReady,
 }
 
-impl TryFrom<quinn_proto::WriteError> for WriteError {
+impl TryFrom<noq_proto::WriteError> for WriteError {
     type Error = ();
 
-    fn try_from(value: quinn_proto::WriteError) -> Result<Self, Self::Error> {
-        use quinn_proto::WriteError::*;
+    fn try_from(value: noq_proto::WriteError) -> Result<Self, Self::Error> {
+        use noq_proto::WriteError::*;
         match value {
             Stopped(e) => Ok(Self::Stopped(e)),
             ClosedStream => Ok(Self::ClosedStream),
@@ -293,7 +293,7 @@ impl From<StoppedError> for WriteError {
 impl From<WriteError> for io::Error {
     fn from(x: WriteError) -> Self {
         use WriteError::*;
-        let kind = match x {
+        let kind = match &x {
             Stopped(_) | ZeroRttRejected => io::ErrorKind::ConnectionReset,
             ConnectionLost(_) | ClosedStream => io::ErrorKind::NotConnected,
             #[cfg(feature = "h3")]
