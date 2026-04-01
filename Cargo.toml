@@ -1,13 +1,12 @@
 [package]
-name = "compio-quic"
-version = "0.7.0"
-description = "QUIC for compio"
+name = "comnoq"
+version = "0.1.0"
+description = "QUIC for compio with noq backend"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "net", "quic"]
 readme = "README.md"
-edition = { workspace = true }
-license = { workspace = true }
-repository = { workspace = true }
+license = "MIT"
+edition = "2024"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -15,52 +14,45 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # Workspace dependencies
-compio-io = { workspace = true, features = ["ancillary", "bytemuck"] }
-compio-buf = { workspace = true, features = ["bytes"] }
-compio-log = { workspace = true }
-compio-net = { workspace = true }
-compio-runtime = { workspace = true, features = ["time"] }
+compio = { version = "0.18.0", features = ["bytes", "dispatcher", "fs", "io", "macros", "net", "runtime", "sync", "time"] }
+compio-log = "0.1.0"
 
 noq-proto = { version = "0.16.0", default-features = false }
-rustls = { workspace = true }
-rustls-platform-verifier = { workspace = true, optional = true }
-rustls-native-certs = { workspace = true, optional = true }
-webpki-roots = { workspace = true, optional = true }
+rustls = "0.23.37"
+rustls-platform-verifier = { version = "0.6.2", optional = true }
+rustls-native-certs = { version = "0.8.3", optional = true }
+webpki-roots = { version = "1.0.6", optional = true }
 h3 = { version = "0.0.8", optional = true }
 h3-datagram = { version = "0.0.2", optional = true }
 
 # Utils
-flume = { workspace = true, default-features = false, features = ["async"] }
-futures-util = { workspace = true }
-thiserror = { workspace = true }
+flume = { version = "0.12.0", default-features = false, features = ["async"] }
+futures-util = "0.3.32"
+thiserror = "2.0.18"
 rustc-hash = "2.0.0"
-synchrony = { workspace = true }
+synchrony = { version = "0.1.7", features = ["async_flag"] }
 
 # Windows specific dependencies
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+libc = "0.2.183"
 
 [build-dependencies]
-cfg_aliases = { workspace = true }
+cfg_aliases = "0.2.1"
 
 [dev-dependencies]
-compio-dispatcher = { workspace = true }
-compio-driver = { workspace = true }
-compio-fs = { workspace = true }
-compio-macros = { workspace = true }
-compio-runtime = { workspace = true, features = ["criterion"] }
+compio = { version = "0.18.0", features = ["bytes", "criterion", "fs", "io", "macros", "net", "runtime", "sync", "time"] }
 
-criterion = { workspace = true, features = ["async_tokio"] }
+criterion = { version = "0.8.2", features = ["async_tokio"] }
 http = "1.1.0"
 noq = "0.17.0"
-rand = { workspace = true }
+rand = "0.10.0"
 rcgen = "0.14.1"
-socket2 = { workspace = true, features = ["all"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+socket2 = { version = "0.6.3", features = ["all"] }
+tokio = { version = "1.50.0", features = ["macros", "rt"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [features]
 default = ["ring"]
@@ -81,10 +73,6 @@ required-features = ["h3"]
 [[example]]
 name = "http3-server"
 required-features = ["h3"]
-
-[[example]]
-name = "quic-dispatcher"
-required-features = ["compio-driver/sync"]
 
 [[bench]]
 name = "quic"

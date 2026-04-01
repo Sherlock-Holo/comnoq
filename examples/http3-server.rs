@@ -1,9 +1,9 @@
-use compio_buf::bytes::Bytes;
-use compio_quic::ServerBuilder;
+use comnoq::ServerBuilder;
+use compio::buf::bytes::Bytes;
 use http::{HeaderMap, Response};
 use tracing_subscriber::EnvFilter;
 
-#[compio_macros::main]
+#[compio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -23,11 +23,11 @@ async fn main() {
         .unwrap();
 
     while let Some(incoming) = endpoint.wait_incoming().await {
-        compio_runtime::spawn(async move {
+        compio::runtime::spawn(async move {
             let conn = incoming.await.unwrap();
             println!("Accepted connection from {}", conn.remote_address());
 
-            let mut conn = compio_quic::h3::server::builder()
+            let mut conn = comnoq::h3::server::builder()
                 .build::<_, Bytes>(conn)
                 .await
                 .unwrap();

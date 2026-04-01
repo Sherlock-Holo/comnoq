@@ -4,8 +4,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use compio_buf::{BufResult, IoBufMut, bytes::Bytes};
-use compio_io::AsyncRead;
+use compio::buf::{BufResult, IoBufMut, bytes::Bytes};
+use compio::io::AsyncRead;
 use futures_util::future::poll_fn;
 use noq_proto::{Chunk, Chunks, ClosedStream, ReadableError, StreamId, VarInt};
 use thiserror::Error;
@@ -542,7 +542,7 @@ mod compat {
         task::ready,
     };
 
-    use compio_buf::{IntoInner, bytes::BufMut};
+    use compio::buf::{IntoInner, bytes::BufMut};
 
     use super::*;
 

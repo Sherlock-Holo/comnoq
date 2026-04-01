@@ -4,14 +4,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use compio_io::AsyncWriteExt;
-use compio_quic::{ClientBuilder, ConnectionError, Endpoint, TransportConfig};
+use comnoq::{ClientBuilder, ConnectionError, Endpoint, TransportConfig};
+use compio::io::AsyncWriteExt;
 use futures_util::join;
 
 mod common;
 use common::{config_pair, subscribe};
 
-#[compio_macros::test]
+#[compio::test]
 async fn handshake_timeout() {
     let _guard = subscribe();
 
@@ -46,7 +46,7 @@ async fn handshake_timeout() {
     endpoint.shutdown().await.unwrap();
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn close_endpoint() {
     let _guard = subscribe();
 
@@ -83,7 +83,7 @@ async fn endpoint() -> Endpoint {
     endpoint
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn read_after_close() {
     let _guard = subscribe();
 
@@ -115,7 +115,7 @@ async fn read_after_close() {
     endpoint.shutdown().await.unwrap();
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn export_keying_material() {
     let _guard = subscribe();
 
@@ -147,7 +147,7 @@ async fn export_keying_material() {
     endpoint.shutdown().await.unwrap();
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn zero_rtt() {
     let _guard = subscribe();
 
@@ -234,7 +234,7 @@ async fn zero_rtt() {
     endpoint.shutdown().await.unwrap();
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn two_datagram_readers() {
     let _guard = subscribe();
 
@@ -283,7 +283,7 @@ async fn two_datagram_readers() {
     endpoint.shutdown().await.unwrap();
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn try_recv_datagram() {
     let _guard = subscribe();
 

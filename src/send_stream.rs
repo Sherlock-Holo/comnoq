@@ -3,8 +3,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use compio_buf::{BufResult, IoBuf, bytes::Bytes};
-use compio_io::AsyncWrite;
+use compio::buf::{BufResult, IoBuf, bytes::Bytes};
+use compio::io::AsyncWrite;
 use futures_util::{future::poll_fn, ready};
 use noq_proto::{ClosedStream, FinishError, StreamId, VarInt, Written};
 use thiserror::Error;
@@ -356,7 +356,7 @@ mod compat {
         pin::Pin,
     };
 
-    use compio_buf::IntoInner;
+    use compio::buf::IntoInner;
 
     use super::*;
 
@@ -444,7 +444,7 @@ pub use compat::CompatSendStream;
 
 #[cfg(feature = "h3")]
 pub(crate) mod h3_impl {
-    use compio_buf::bytes::Buf;
+    use compio::buf::bytes::Buf;
     use h3::quic::{self, StreamErrorIncoming, WriteBuf};
 
     use super::*;

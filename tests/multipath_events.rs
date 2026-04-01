@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use compio_quic::{
+use comnoq::{
     Endpoint, PathError, PathEvent, PathId, PathStatus, TransportConfig, n0_nat_traversal,
 };
 use futures_util::join;
@@ -20,7 +20,7 @@ async fn endpoint_with_transport(transport: TransportConfig) -> Endpoint {
     endpoint
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn handshake_confirmed_and_open_path_event() {
     let _guard = subscribe();
 
@@ -48,7 +48,7 @@ async fn handshake_confirmed_and_open_path_event() {
         match client.open_path(server_addr, PathStatus::Available).await {
             Ok(path) => break path,
             Err(PathError::RemoteCidsExhausted) => {
-                compio_runtime::time::sleep(Duration::from_millis(10)).await;
+                compio::runtime::time::sleep(Duration::from_millis(10)).await;
             }
             Err(err) => panic!("unexpected open_path error: {err:?}"),
         }
@@ -70,7 +70,7 @@ async fn handshake_confirmed_and_open_path_event() {
     endpoint.shutdown().await.unwrap();
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn nat_traversal_updates_are_forwarded() {
     let _guard = subscribe();
 

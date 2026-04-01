@@ -7,9 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use compio_buf::bytes::Bytes;
+use compio::buf::bytes::Bytes;
+use compio::runtime::JoinHandle;
 use compio_log::Instrument;
-use compio_runtime::JoinHandle;
 use flume::{Receiver, Sender, unbounded};
 use futures_util::{
     FutureExt, StreamExt,
@@ -515,7 +515,7 @@ impl Connecting {
         let inner = Shared::new(ConnectionInner::new(
             handle, conn, socket, events_tx, events_rx,
         ));
-        let worker = compio_runtime::spawn({
+        let worker = compio::runtime::spawn({
             let inner = inner.clone();
             async move { inner.run().await }.in_current_span()
         });
@@ -1147,7 +1147,7 @@ impl Timer {
     fn reset(&mut self, deadline: Option<Instant>) {
         if let Some(deadline) = deadline {
             if self.deadline.is_none() || self.deadline != Some(deadline) {
-                self.fut = compio_runtime::time::sleep_until(deadline)
+                self.fut = compio::runtime::time::sleep_until(deadline)
                     .boxed_local()
                     .fuse();
             }
@@ -1264,7 +1264,7 @@ pub enum OpenStreamError {
 pub(crate) mod h3_impl {
     use std::sync::Arc;
 
-    use compio_buf::bytes::Buf;
+    use compio::buf::bytes::Buf;
     use futures_util::ready;
     use h3::{
         error::Code,

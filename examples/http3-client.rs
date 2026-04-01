@@ -4,14 +4,14 @@ use std::{
     str::FromStr,
 };
 
-use compio_buf::bytes::Buf;
-use compio_io::AsyncWriteAtExt;
-use compio_net::ToSocketAddrsAsync;
-use compio_quic::ClientBuilder;
+use comnoq::ClientBuilder;
+use compio::buf::bytes::Buf;
+use compio::io::AsyncWriteAtExt;
+use compio::net::ToSocketAddrsAsync;
 use http::{Request, Uri};
 use tracing_subscriber::EnvFilter;
 
-#[compio_macros::main]
+#[compio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -52,8 +52,8 @@ async fn main() {
         println!("Connecting to {host} at {remote}");
         let conn = endpoint.connect(remote, host, None).unwrap().await.unwrap();
 
-        let (mut conn, mut send_req) = compio_quic::h3::client::new(conn).await.unwrap();
-        let handle = compio_runtime::spawn(async move { conn.wait_idle().await });
+        let (mut conn, mut send_req) = comnoq::h3::client::new(conn).await.unwrap();
+        let handle = compio::runtime::spawn(async move { conn.wait_idle().await });
 
         let req = Request::get(uri).body(()).unwrap();
         let mut stream = send_req.send_request(req).await.unwrap();
@@ -62,7 +62,7 @@ async fn main() {
         let resp = stream.recv_response().await.unwrap();
         println!("{resp:?}");
 
-        let mut out = compio_fs::File::create(outpath).await.unwrap();
+        let mut out = compio::fs::File::create(outpath).await.unwrap();
         let mut pos = 0;
         while let Some(mut chunk) = stream.recv_data().await.unwrap() {
             let len = chunk.remaining();

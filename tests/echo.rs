@@ -3,9 +3,9 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
-use compio_buf::bytes::Bytes;
-use compio_io::AsyncWriteExt;
-use compio_quic::{Endpoint, RecvStream, SendStream, TransportConfig};
+use comnoq::{Endpoint, RecvStream, SendStream, TransportConfig};
+use compio::buf::bytes::Bytes;
+use compio::io::AsyncWriteExt;
 
 mod common;
 use common::{config_pair, subscribe};
@@ -71,7 +71,7 @@ async fn run_echo(args: EchoArgs) {
             let conn = server.wait_incoming().await.unwrap().await.unwrap();
 
             while let Ok(stream) = conn.accept_bi().await {
-                compio_runtime::spawn(echo(stream)).detach();
+                compio::runtime::spawn(echo(stream)).detach();
             }
         },
         async {
@@ -107,7 +107,7 @@ async fn run_echo(args: EchoArgs) {
     server.shutdown().await.unwrap();
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn echo_v6() {
     let _guard = subscribe();
     run_echo(EchoArgs {
@@ -121,7 +121,7 @@ async fn echo_v6() {
     .await;
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn echo_v4() {
     let _guard = subscribe();
     run_echo(EchoArgs {
@@ -135,7 +135,7 @@ async fn echo_v4() {
     .await;
 }
 
-#[compio_macros::test]
+#[compio::test]
 #[cfg_attr(any(bsd, solarish, windows), ignore)]
 async fn echo_dualstack() {
     let _guard = subscribe();
@@ -150,7 +150,7 @@ async fn echo_dualstack() {
     .await;
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn stress_receive_window() {
     run_echo(EchoArgs {
         client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -163,7 +163,7 @@ async fn stress_receive_window() {
     .await;
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn stress_stream_receive_window() {
     // Note that there is no point in running this with too many streams,
     // since the window is only active within a stream.
@@ -178,7 +178,7 @@ async fn stress_stream_receive_window() {
     .await;
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn stress_both_windows() {
     run_echo(EchoArgs {
         client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),

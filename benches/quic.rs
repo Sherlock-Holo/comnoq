@@ -4,14 +4,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use compio_buf::bytes::Bytes;
+use compio::buf::bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use rand::{Rng, rng};
 
 macro_rules! compio_spawn {
     ($fut:expr) => {
-        compio_runtime::spawn($fut).detach()
+        compio::runtime::spawn($fut).detach()
     };
 }
 
@@ -56,8 +56,8 @@ fn start_compio_quic_server(
     let (tx, rx) = flume::bounded(0);
 
     std::thread::spawn(move || {
-        compio_runtime::Runtime::new().unwrap().block_on(async {
-            let server = compio_quic::ServerBuilder::new_with_single_cert(vec![cert], key_der)
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let server = comnoq::ServerBuilder::new_with_single_cert(vec![cert], key_der)
                 .unwrap()
                 .bind((Ipv4Addr::LOCALHOST, 0))
                 .await
@@ -104,7 +104,7 @@ fn start_quinn_server(
 }
 
 async fn compio_quic_echo_client(
-    client: &compio_quic::Endpoint,
+    client: &comnoq::Endpoint,
     remote: SocketAddr,
     data: &[u8],
     iters: u64,
@@ -185,9 +185,9 @@ fn main() {
     let compio_quic_server = start_compio_quic_server(cert.clone(), key_der.clone_key());
     let quinn_server = start_quinn_server(cert.clone(), key_der);
 
-    let compio_rt = compio_runtime::Runtime::new().unwrap();
+    let compio_rt = compio::runtime::Runtime::new().unwrap();
     let compio_quic_client = compio_rt.block_on(async {
-        compio_quic::ClientBuilder::new_with_empty_roots()
+        comnoq::ClientBuilder::new_with_empty_roots()
             .with_custom_certificate(cert.clone())
             .unwrap()
             .with_no_crls()

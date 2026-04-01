@@ -1,11 +1,11 @@
-use compio_quic::{ConnectionError, Endpoint, TransportConfig};
+use comnoq::{ConnectionError, Endpoint, TransportConfig};
 use synchrony::unsync::async_flag::AsyncFlag;
 
 mod common;
 use common::{config_pair, subscribe};
 use futures_util::{FutureExt, join};
 
-#[compio_macros::test]
+#[compio::test]
 async fn ip_blocking() {
     let _guard = subscribe();
 
@@ -23,7 +23,7 @@ async fn ip_blocking() {
     let shutdown_flag = AsyncFlag::new();
     let shutdown_handle = shutdown_flag.handle();
 
-    let srv = compio_runtime::spawn(async move {
+    let srv = compio::runtime::spawn(async move {
         let wait_fut = shutdown_flag.wait().fuse();
         let mut wait_fut = std::pin::pin!(wait_fut);
         loop {
@@ -62,7 +62,7 @@ async fn ip_blocking() {
     client1.shutdown().await.unwrap();
 }
 
-#[compio_macros::test]
+#[compio::test]
 async fn stream_id_flow_control() {
     let _guard = subscribe();
 

@@ -13,12 +13,12 @@ use std::{
     time::Instant,
 };
 
-use compio_buf::{BufResult, bytes::Bytes};
-use compio_log::{Instrument, error};
+use compio::buf::{BufResult, bytes::Bytes};
 #[cfg(rustls)]
-use compio_net::ToSocketAddrsAsync;
-use compio_net::UdpSocket;
-use compio_runtime::JoinHandle;
+use compio::net::ToSocketAddrsAsync;
+use compio::net::UdpSocket;
+use compio::runtime::JoinHandle;
+use compio_log::{Instrument, error};
 use flume::{Receiver, Sender, unbounded};
 use futures_util::{FutureExt, StreamExt, future, select, task::AtomicWaker};
 use noq_proto::{
@@ -230,7 +230,7 @@ impl EndpointInner {
 
     fn respond(&self, buf: Vec<u8>, transmit: Transmit) {
         let socket = self.socket.clone();
-        compio_runtime::spawn(async move {
+        compio::runtime::spawn(async move {
             socket.send(buf, &transmit).await;
         })
         .detach();
@@ -428,7 +428,7 @@ impl Endpoint {
             config,
             server_config,
         )?));
-        let worker = compio_runtime::spawn({
+        let worker = compio::runtime::spawn({
             let inner = inner.clone();
             async move {
                 #[allow(unused)]
