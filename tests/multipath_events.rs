@@ -11,13 +11,14 @@ use futures_util::join;
 mod common;
 use common::{config_pair, subscribe};
 
-async fn endpoint_with_transport(transport: TransportConfig) -> Endpoint {
+async fn endpoint_pair_with_transport(transport: TransportConfig) -> (Endpoint, Endpoint) {
     let (server_config, client_config) = config_pair(Some(transport));
-    let mut endpoint = Endpoint::server("127.0.0.1:0", server_config)
+    let server = Endpoint::server("127.0.0.1:0", server_config)
         .await
         .unwrap();
-    endpoint.default_client_config = Some(client_config);
-    endpoint
+    let mut client = Endpoint::client("127.0.0.1:0").await.unwrap();
+    client.default_client_config = Some(client_config);
+    (client, server)
 }
 
 #[compio::test]
@@ -26,18 +27,25 @@ async fn handshake_confirmed_and_open_path_event() {
 
     let mut transport = TransportConfig::default();
     transport.max_concurrent_multipath_paths(2);
-    let endpoint = endpoint_with_transport(transport).await;
-    let server_addr = endpoint.local_addr().unwrap();
+    let (client_endpoint, server_endpoint) = endpoint_pair_with_transport(transport).await;
+    let server_addr = server_endpoint.local_addr().unwrap();
 
     let (client, server) = join!(
         async {
-            endpoint
+            client_endpoint
                 .connect(server_addr, "localhost", None)
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async { endpoint.wait_incoming().await.unwrap().await.unwrap() },
+        async {
+            server_endpoint
+                .wait_incoming()
+                .await
+                .unwrap()
+                .await
+                .unwrap()
+        },
     );
 
     client.handshake_confirmed().await.unwrap();
@@ -67,7 +75,8 @@ async fn handshake_confirmed_and_open_path_event() {
     drop(path);
     drop(server);
     drop(client);
-    endpoint.shutdown().await.unwrap();
+    client_endpoint.shutdown().await.unwrap();
+    server_endpoint.shutdown().await.unwrap();
 }
 
 #[compio::test]
@@ -76,18 +85,25 @@ async fn nat_traversal_updates_are_forwarded() {
 
     let mut transport = TransportConfig::default();
     transport.set_max_remote_nat_traversal_addresses(2);
-    let endpoint = endpoint_with_transport(transport).await;
-    let server_addr = endpoint.local_addr().unwrap();
+    let (client_endpoint, server_endpoint) = endpoint_pair_with_transport(transport).await;
+    let server_addr = server_endpoint.local_addr().unwrap();
 
     let (client, server) = join!(
         async {
-            endpoint
+            client_endpoint
                 .connect(server_addr, "localhost", None)
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async { endpoint.wait_incoming().await.unwrap().await.unwrap() },
+        async {
+            server_endpoint
+                .wait_incoming()
+                .await
+                .unwrap()
+                .await
+                .unwrap()
+        },
     );
 
     client.handshake_confirmed().await.unwrap();
@@ -105,5 +121,6 @@ async fn nat_traversal_updates_are_forwarded() {
 
     drop(server);
     drop(client);
-    endpoint.shutdown().await.unwrap();
+    client_endpoint.shutdown().await.unwrap();
+    server_endpoint.shutdown().await.unwrap();
 }
