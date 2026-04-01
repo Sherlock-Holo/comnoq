@@ -74,6 +74,10 @@ required-features = ["h3"]
 name = "http3-server"
 required-features = ["h3"]
 
+[[example]]
+name = "quic-dispatcher"
+required-features = ["sync"]
+
 [[bench]]
 name = "quic"
 harness = false

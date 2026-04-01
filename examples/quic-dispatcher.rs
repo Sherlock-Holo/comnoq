@@ -1,0 +1,78 @@
+use std::num::NonZeroUsize;
+
+use comnoq::{ClientBuilder, Endpoint, ServerBuilder};
+use compio::io::AsyncWriteExt;
+use compio::{buf::BufResult, dispatcher::Dispatcher, runtime::spawn};
+use futures_util::{StreamExt, stream::FuturesUnordered};
+
+#[compio::main]
+async fn main() {
+    const THREAD_NUM: usize = 5;
+    const CLIENT_NUM: usize = 10;
+
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = cert.der().clone();
+    let key_der = signing_key.serialize_der().try_into().unwrap();
+
+    let server_config = ServerBuilder::new_with_single_cert(vec![cert.clone()], key_der)
+        .unwrap()
+        .build();
+    let client_config = ClientBuilder::new_with_empty_roots()
+        .with_custom_certificate(cert)
+        .unwrap()
+        .with_no_crls()
+        .build();
+    let mut endpoint = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .unwrap();
+    endpoint.default_client_config = Some(client_config);
+
+    spawn({
+        let endpoint = endpoint.clone();
+        async move {
+            let mut futures = FuturesUnordered::from_iter((0..CLIENT_NUM).map(|i| {
+                let endpoint = &endpoint;
+                async move {
+                    let conn = endpoint
+                        .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                        .unwrap()
+                        .await
+                        .unwrap();
+                    let mut send = conn.open_uni().unwrap();
+                    let msg = format!("Hello world {i}!").into_bytes();
+                    let BufResult(res, _) = send.write_all(msg).await;
+                    res.unwrap();
+                    send.finish().unwrap();
+                    send.stopped().await.unwrap();
+                }
+            }));
+            while let Some(()) = futures.next().await {}
+        }
+    })
+    .detach();
+
+    let dispatcher = Dispatcher::builder()
+        .worker_threads(NonZeroUsize::new(THREAD_NUM).unwrap())
+        .build()
+        .unwrap();
+    let mut handles = FuturesUnordered::new();
+    for _ in 0..CLIENT_NUM {
+        let incoming = endpoint.wait_incoming().await.unwrap();
+        let handle = dispatcher
+            .dispatch(move || async move {
+                let conn = incoming.await.unwrap();
+                let mut recv = conn.accept_uni().await.unwrap();
+                let (_, buf) = recv.read_to_end(vec![]).await.unwrap();
+                println!("{}", std::str::from_utf8(&buf).unwrap());
+
+                conn.close(0u32.into(), b"done");
+                conn.closed().await;
+            })
+            .unwrap();
+        handles.push(handle);
+    }
+    while handles.next().await.is_some() {}
+    dispatcher.join().await.unwrap();
+    endpoint.shutdown().await.unwrap();
+}
