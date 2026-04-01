@@ -18,7 +18,7 @@ compio = { version = "0.18.0", features = ["bytes", "dispatcher", "fs", "io", "m
 compio-log = "0.1.0"
 
 noq-proto = { version = "0.16.0", default-features = false }
-rustls = "0.23.37"
+rustls = { version = "0.23.37", default-features = false, features = ["std"] }
 rustls-platform-verifier = { version = "0.6.2", optional = true }
 rustls-native-certs = { version = "0.8.3", optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
@@ -62,7 +62,7 @@ native-certs = ["dep:rustls-native-certs"]
 webpki-roots = ["dep:webpki-roots"]
 qlog = ["noq-proto/qlog"]
 h3 = ["dep:h3", "dep:h3-datagram"]
-ring = ["noq-proto/rustls-ring"]
+ring = ["noq-proto/rustls-ring", "rustls/ring"]
 windows-gro = []
 sync = []
 
