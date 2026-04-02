@@ -13,6 +13,8 @@
     html_favicon_url = "https://github.com/compio-rs/compio-logo/raw/refs/heads/master/generated/colored-bold.svg"
 )]
 
+#[cfg(feature = "qlog")]
+pub use noq_proto::QlogConfig;
 pub use noq_proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosePathError, ClosedPath,
     ClosedStream, ConfigError, ConnectError, ConnectionClose, ConnectionId, ConnectionIdGenerator,
@@ -23,8 +25,6 @@ pub use noq_proto::{
     Transmit, TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
     VarIntBoundsExceeded, Written, congestion, crypto, n0_nat_traversal,
 };
-#[cfg(feature = "qlog")]
-pub use noq_proto::{QlogConfig, QlogStream};
 
 #[cfg(rustls)]
 mod builder;
