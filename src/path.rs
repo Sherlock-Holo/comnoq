@@ -88,14 +88,6 @@ pub struct Path {
 }
 
 impl Path {
-    pub(crate) fn new(conn: &Shared<ConnectionInner>, id: PathId) -> Option<Self> {
-        conn.state().conn.path_status(id).ok()?;
-        Some(Self {
-            id,
-            conn: conn.clone(),
-        })
-    }
-
     pub(crate) fn new_unchecked(conn: Shared<ConnectionInner>, id: PathId) -> Self {
         Self { id, conn }
     }

@@ -238,6 +238,26 @@ impl ConnectionInner {
         }
     }
 
+    pub(crate) fn path(inner: &Shared<Self>, id: PathId) -> Option<Path> {
+        inner.state.lock().conn.path_status(id).ok()?;
+
+        Some(Path::new_unchecked(inner.clone(), id))
+    }
+
+    pub(crate) fn paths(inner: &Shared<ConnectionInner>) -> Vec<Path> {
+        let state = inner.state.lock();
+        let path_ids = state.conn.paths();
+
+        path_ids
+            .into_iter()
+            .filter_map(|id| {
+                state.conn.path_status(id).ok()?;
+
+                Some(Path::new_unchecked(inner.clone(), id))
+            })
+            .collect()
+    }
+
     async fn run(&self) {
         let mut poller = stream::poll_fn(|cx| {
             let mut state = self.state();
@@ -818,7 +838,7 @@ impl Connection {
 
     /// Returns the path handle for an open path.
     pub fn path(&self, id: PathId) -> Option<Path> {
-        Path::new(&self.0, id)
+        ConnectionInner::path(&self.0, id)
     }
 
     /// Subscribe to path events for this connection.
@@ -826,6 +846,11 @@ impl Connection {
         let (tx, rx) = unbounded();
         self.0.state().path_events.push(tx);
         rx
+    }
+
+    /// Returns the path handles
+    pub fn paths(&self) -> Vec<Path> {
+        ConnectionInner::paths(&self.0)
     }
 
     /// Subscribe to NAT traversal updates for this connection.
