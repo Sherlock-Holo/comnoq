@@ -258,6 +258,34 @@ impl ConnectionInner {
             .collect()
     }
 
+    pub(crate) fn all_path_stats(&self) -> HashMap<PathId, PathStats> {
+        let mut state = self.state.lock();
+        state
+            .conn
+            .paths()
+            .into_iter()
+            .filter_map(|id| {
+                let stats = state.conn.path_stats(id)?;
+
+                Some((id, stats))
+            })
+            .collect()
+    }
+
+    pub(crate) fn all_path_status(&self) -> HashMap<PathId, PathStatus> {
+        let state = self.state.lock();
+        state
+            .conn
+            .paths()
+            .into_iter()
+            .filter_map(|id| {
+                let status = state.conn.path_status(id).ok()?;
+
+                Some((id, status))
+            })
+            .collect()
+    }
+
     async fn run(&self) {
         let mut poller = stream::poll_fn(|cx| {
             let mut state = self.state();
@@ -848,9 +876,19 @@ impl Connection {
         rx
     }
 
-    /// Returns the path handles
+    /// Returns the path handles.
     pub fn paths(&self) -> Vec<Path> {
         ConnectionInner::paths(&self.0)
+    }
+
+    /// Returns all path stats.
+    pub fn all_path_stats(&self) -> HashMap<PathId, PathStats> {
+        self.0.all_path_stats()
+    }
+
+    /// Returns all path status.
+    pub fn all_path_status(&self) -> HashMap<PathId, PathStatus> {
+        self.0.all_path_status()
     }
 
     /// Subscribe to NAT traversal updates for this connection.
