@@ -13,8 +13,6 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-# Workspace dependencies
-compio = { version = "0.18.0", features = ["bytes", "dispatcher", "fs", "io", "macros", "net", "runtime", "sync", "time"] }
 compio-log = "0.1.0"
 
 noq-proto = { version = "0.16.0", default-features = false }
@@ -32,6 +30,10 @@ thiserror = "2.0.18"
 rustc-hash = "2.0.0"
 synchrony = { version = "0.1.7", features = ["async_flag"] }
 
+[dependencies.compio]
+version = "0.18.0"
+features = ["bytes", "dispatcher", "fs", "io", "macros", "net", "runtime", "sync", "time"]
+
 # Windows specific dependencies
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
@@ -43,8 +45,7 @@ libc = "0.2.183"
 cfg_aliases = "0.2.1"
 
 [dev-dependencies]
-compio = { version = "0.18.0", features = ["bytes", "criterion", "fs", "io", "macros", "net", "runtime", "sync", "time"] }
-
+compio = { version = "0.18.0", features = ["criterion"] }
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 http = "1.1.0"
 noq = "0.17.0"

@@ -49,7 +49,7 @@ macro_rules! echo_server_impl {
     };
 }
 
-fn start_compio_quic_server(
+fn start_comnoq_server(
     cert: rustls::pki_types::CertificateDer<'static>,
     key_der: rustls::pki_types::PrivateKeyDer<'static>,
 ) -> SocketAddr {
@@ -74,7 +74,7 @@ fn start_compio_quic_server(
     rx.recv().unwrap()
 }
 
-fn start_quinn_server(
+fn start_noq_server(
     cert: rustls::pki_types::CertificateDer<'static>,
     key_der: rustls::pki_types::PrivateKeyDer<'static>,
 ) -> SocketAddr {
@@ -87,10 +87,9 @@ fn start_quinn_server(
             .unwrap()
             .block_on(async {
                 let server_config =
-                    quinn::ServerConfig::with_single_cert(vec![cert], key_der).unwrap();
+                    noq::ServerConfig::with_single_cert(vec![cert], key_der).unwrap();
                 let server =
-                    quinn::Endpoint::server(server_config, (Ipv4Addr::LOCALHOST, 0).into())
-                        .unwrap();
+                    noq::Endpoint::server(server_config, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
 
                 tx.send(server.local_addr().unwrap()).unwrap();
 
@@ -103,7 +102,7 @@ fn start_quinn_server(
     rx.recv().unwrap()
 }
 
-async fn compio_quic_echo_client(
+async fn comnoq_echo_client(
     client: &comnoq::Endpoint,
     remote: SocketAddr,
     data: &[u8],
@@ -141,8 +140,8 @@ async fn compio_quic_echo_client(
     elapsed
 }
 
-async fn quinn_echo_client(
-    client: &quinn::Endpoint,
+async fn noq_echo_client(
+    client: &noq::Endpoint,
     remote: SocketAddr,
     data: &[u8],
     iters: u64,
@@ -182,11 +181,11 @@ fn main() {
     let cert = cert.der().clone();
     let key_der: rustls::pki_types::PrivateKeyDer = signing_key.serialize_der().try_into().unwrap();
 
-    let compio_quic_server = start_compio_quic_server(cert.clone(), key_der.clone_key());
-    let quinn_server = start_quinn_server(cert.clone(), key_der);
+    let comnoq_server = start_comnoq_server(cert.clone(), key_der.clone_key());
+    let noq_server = start_noq_server(cert.clone(), key_der);
 
     let compio_rt = compio::runtime::Runtime::new().unwrap();
-    let compio_quic_client = compio_rt.block_on(async {
+    let comnoq_client = compio_rt.block_on(async {
         comnoq::ClientBuilder::new_with_empty_roots()
             .with_custom_certificate(cert.clone())
             .unwrap()
@@ -200,11 +199,11 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
-    let quinn_client = tokio_rt.block_on(async {
+    let noq_client = tokio_rt.block_on(async {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert).unwrap();
-        let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
-        let mut client = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let client_config = noq::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let client = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
         client.set_default_client_config(client_config);
         client
     });
@@ -218,19 +217,15 @@ fn main() {
     let mut g = c.benchmark_group("quic-echo");
     g.throughput(Throughput::Bytes((DATA_SIZE * 2) as u64));
 
-    for (server_name, remote) in [
-        ("compio-quic-server", compio_quic_server),
-        ("quinn-server", quinn_server),
-    ] {
-        g.bench_function(BenchmarkId::new("compio-quic", server_name), |b| {
-            b.to_async(&compio_rt).iter_custom(|iters| {
-                compio_quic_echo_client(&compio_quic_client, remote, &data, iters)
-            });
+    for (server_name, remote) in [("comnoq-server", comnoq_server), ("noq-server", noq_server)] {
+        g.bench_function(BenchmarkId::new("comnoq", server_name), |b| {
+            b.to_async(&compio_rt)
+                .iter_custom(|iters| comnoq_echo_client(&comnoq_client, remote, &data, iters));
         });
 
-        g.bench_function(BenchmarkId::new("quinn", server_name), |b| {
+        g.bench_function(BenchmarkId::new("noq", server_name), |b| {
             b.to_async(&tokio_rt)
-                .iter_custom(|iters| quinn_echo_client(&quinn_client, remote, &data, iters));
+                .iter_custom(|iters| noq_echo_client(&noq_client, remote, &data, iters));
         });
     }
     g.finish();
