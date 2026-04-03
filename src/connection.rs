@@ -138,6 +138,16 @@ fn wake_waiters(wakers: &mut VecDeque<Waker>) {
     wakers.drain(..).for_each(Waker::wake)
 }
 
+fn push_waker_dedup(wakers: &mut VecDeque<Waker>, waker: &Waker) {
+    for exist_waker in wakers.iter().rev() {
+        if exist_waker.will_wake(waker) {
+            return;
+        }
+    }
+
+    wakers.push_back(waker.clone());
+}
+
 fn broadcast<T: Clone>(listeners: &mut Vec<Sender<T>>, event: T) {
     listeners.retain(|tx| tx.send(event.clone()).is_ok());
 }
@@ -963,7 +973,7 @@ impl Connection {
         if let Some(bytes) = state.conn.datagrams().recv() {
             return Poll::Ready(Ok(bytes));
         }
-        state.datagram_received.push_back(cx.waker().clone());
+        push_waker_dedup(&mut state.datagram_received, cx.waker());
         Poll::Pending
     }
 
