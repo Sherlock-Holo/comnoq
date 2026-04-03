@@ -6,7 +6,7 @@ use std::{
 use comnoq::{
     Endpoint, PathError, PathEvent, PathId, PathStatus, TransportConfig, n0_nat_traversal,
 };
-use futures_util::join;
+use futures_util::{FutureExt, StreamExt, join};
 
 mod common;
 use common::{config_pair, subscribe};
@@ -30,6 +30,71 @@ async fn dual_stack_endpoint_pair_with_transport(
     let mut client = Endpoint::client("[::]:0").await.unwrap();
     client.default_client_config = Some(client_config);
     (client, server)
+}
+
+#[compio::test]
+async fn path_api() {
+    let _guard = subscribe();
+
+    let (client_endpoint, server_endpoint) =
+        endpoint_pair_with_transport(TransportConfig::default()).await;
+    let server_addr = server_endpoint.local_addr().unwrap();
+
+    let (client, server) = join!(
+        async {
+            client_endpoint
+                .connect(server_addr, "localhost", None)
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        async {
+            server_endpoint
+                .wait_incoming()
+                .await
+                .unwrap()
+                .await
+                .unwrap()
+        },
+    );
+
+    let path = client.path(PathId::ZERO).expect("path zero exists");
+    assert_eq!(path, client.path(PathId::ZERO).unwrap());
+    assert_eq!(path.remote_address().unwrap(), client.remote_address());
+
+    let idle_timeout = Duration::from_millis(250);
+    let next_idle_timeout = Duration::from_millis(500);
+    let previous_idle_timeout = path.set_max_idle_timeout(Some(idle_timeout)).unwrap();
+    assert_eq!(
+        path.set_max_idle_timeout(Some(next_idle_timeout)).unwrap(),
+        Some(idle_timeout)
+    );
+    path.set_max_idle_timeout(previous_idle_timeout).unwrap();
+
+    let keep_alive = Duration::from_millis(100);
+    let next_keep_alive = Duration::from_millis(200);
+    let previous_keep_alive = path.set_keep_alive_interval(Some(keep_alive)).unwrap();
+    assert_eq!(
+        path.set_keep_alive_interval(Some(next_keep_alive)).unwrap(),
+        Some(keep_alive)
+    );
+    path.set_keep_alive_interval(previous_keep_alive).unwrap();
+
+    path.ping().unwrap();
+
+    let mut discovery = path.observed_external_addr().unwrap();
+    let first_poll = discovery.next().now_or_never();
+    assert!(
+        !matches!(first_poll, Some(None)),
+        "address discovery stream should not terminate immediately"
+    );
+
+    drop(discovery);
+    drop(path);
+    drop(server);
+    drop(client);
+    client_endpoint.shutdown().await.unwrap();
+    server_endpoint.shutdown().await.unwrap();
 }
 
 #[compio::test]

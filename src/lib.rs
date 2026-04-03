@@ -41,7 +41,7 @@ pub use builder::{ClientBuilder, ServerBuilder};
 pub use connection::{Connecting, Connection, ConnectionError, OpenStreamError, SendDatagramError};
 pub use endpoint::{Endpoint, EndpointStats};
 pub use incoming::{Incoming, IncomingFuture};
-pub use path::{OpenPath, Path};
+pub use path::{AddressDiscovery, OpenPath, Path};
 pub use recv_stream::{ReadError, ReadExactError, RecvStream, ResetError};
 pub use send_stream::{SendStream, StoppedError, WriteError};
 #[cfg(feature = "sync")]

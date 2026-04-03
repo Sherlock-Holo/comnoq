@@ -268,6 +268,12 @@ impl ConnectionInner {
             .collect()
     }
 
+    pub(crate) fn subscribe_path_events(inner: &Shared<ConnectionInner>) -> Receiver<PathEvent> {
+        let (tx, rx) = unbounded();
+        inner.state().path_events.push(tx);
+        rx
+    }
+
     pub(crate) fn all_path_stats(&self) -> HashMap<PathId, PathStats> {
         let mut state = self.state.lock();
         state
