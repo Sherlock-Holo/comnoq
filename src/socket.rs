@@ -17,13 +17,61 @@ use std::{
     sync::atomic::Ordering,
 };
 
-use compio::buf::{BufResult, IntoInner, IoBuf, IoBufMut, buf_try};
+use compio::buf::{BufResult, IntoInner, IoBuf, IoBufMut, SetLen, buf_try};
 use compio::net::{CMsgBuilder, CMsgIter, UdpSocket};
 use noq_proto::{EcnCodepoint, Transmit};
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock;
 
 use crate::sync::atomic::AtomicBool;
+
+const CMSG_LEN: usize = 128;
+
+#[repr(align(16))]
+struct AlignedControlBytes([u8; CMSG_LEN]);
+
+struct ControlBuf {
+    buf: AlignedControlBytes,
+    len: usize,
+}
+
+impl ControlBuf {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: AlignedControlBytes([0; CMSG_LEN]),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn as_uninit_slice(&mut self) -> &mut [MaybeUninit<u8>] {
+        // SAFETY: `u8` and `MaybeUninit<u8>` have identical layout.
+        unsafe { std::slice::from_raw_parts_mut(self.buf.0.as_mut_ptr().cast(), CMSG_LEN) }
+    }
+}
+
+impl IoBuf for ControlBuf {
+    #[inline]
+    fn as_init(&self) -> &[u8] {
+        &self.buf.0[..self.len]
+    }
+}
+
+impl SetLen for ControlBuf {
+    #[inline]
+    unsafe fn set_len(&mut self, len: usize) {
+        debug_assert!(len <= CMSG_LEN);
+        self.len = len;
+    }
+}
+
+impl IoBufMut for ControlBuf {
+    #[inline]
+    fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+        self.as_uninit_slice()
+    }
+}
 
 /// Metadata for a single buffer filled with bytes received from the network
 ///
@@ -55,8 +103,6 @@ pub(crate) struct RecvMeta {
     /// NetBSD, macOS, and iOS.
     pub local_ip: Option<IpAddr>,
 }
-
-const CMSG_LEN: usize = 128;
 
 fn push_cmsg<T>(builder: &mut CMsgBuilder<'_>, level: i32, ty: i32, value: T) -> io::Result<()> {
     builder
@@ -288,7 +334,7 @@ impl Socket {
     }
 
     pub async fn recv<T: IoBufMut>(&self, buffer: T) -> BufResult<RecvMeta, T> {
-        let control = Vec::<u8>::with_capacity(CMSG_LEN);
+        let control = ControlBuf::new();
 
         let BufResult(res, (buffer, control)) = self.inner.recv_msg(buffer, control).await;
         let ((len, control_len, remote), buffer) = buf_try!(res, buffer);
@@ -301,7 +347,7 @@ impl Socket {
         if control_len > 0 {
             // SAFETY: `control[..control_len]` is initialized by `recv_msg` and contains
             // valid control messages returned by the OS.
-            for cmsg in unsafe { CMsgIter::new(&control[..control_len]) } {
+            for cmsg in unsafe { CMsgIter::new(&control.as_init()[..control_len]) } {
                 #[cfg(windows)]
                 const UDP_COALESCED_INFO: i32 = WinSock::UDP_COALESCED_INFO as i32;
 
@@ -381,12 +427,12 @@ impl Socket {
         BufResult(Ok(meta), buffer)
     }
 
-    fn construct_control_message(&self, transmit: &Transmit) -> io::Result<Vec<u8>> {
+    fn construct_control_message(&self, transmit: &Transmit) -> io::Result<ControlBuf> {
         let is_ipv4 = transmit.destination.ip().to_canonical().is_ipv4();
         let ecn = transmit.ecn.map_or(0, |x| x as u8);
 
-        let mut control = [MaybeUninit::<u8>::uninit(); CMSG_LEN];
-        let mut builder = CMsgBuilder::new(&mut control);
+        let mut control_buf = ControlBuf::new();
+        let mut builder = CMsgBuilder::new(control_buf.as_uninit_slice());
 
         // ECN
         if is_ipv4 {
@@ -527,7 +573,10 @@ impl Socket {
         }
 
         let len = builder.finish();
-        Ok(unsafe { std::slice::from_raw_parts(control.as_ptr().cast::<u8>(), len) }.to_vec())
+        // SAFETY: `builder.finish()` returns initialized prefix length.
+        unsafe { control_buf.set_len(len) };
+
+        Ok(control_buf)
     }
 
     pub async fn send<T: IoBuf>(&self, buffer: T, transmit: &Transmit) -> T {
