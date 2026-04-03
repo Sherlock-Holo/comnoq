@@ -102,6 +102,56 @@ fn start_noq_server(
     rx.recv().unwrap()
 }
 
+fn start_quinn_server(
+    cert: rustls::pki_types::CertificateDer<'static>,
+    key_der: rustls::pki_types::PrivateKeyDer<'static>,
+) -> SocketAddr {
+    let (tx, rx) = flume::bounded(0);
+
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let server_crypto = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![cert], key_der)
+                    .unwrap();
+                let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+                    quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+                ));
+                let server =
+                    quinn::Endpoint::server(server_config, (Ipv4Addr::LOCALHOST, 0).into())
+                        .unwrap();
+
+                tx.send(server.local_addr().unwrap()).unwrap();
+
+                while let Some(incoming) = server.accept().await {
+                    tokio_spawn!(async move {
+                        let Ok(conn) = incoming.await else {
+                            return;
+                        };
+                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            tokio_spawn!(async move {
+                                while let Ok(Some(chunk)) = recv.read_chunk(usize::MAX, true).await
+                                {
+                                    if send.write_all(&chunk.bytes).await.is_err() {
+                                        break;
+                                    }
+                                }
+
+                                send.finish().ok();
+                            });
+                        }
+                    });
+                }
+            });
+    });
+
+    rx.recv().unwrap()
+}
+
 async fn comnoq_echo_client(
     client: &comnoq::Endpoint,
     remote: SocketAddr,
@@ -173,6 +223,39 @@ async fn noq_echo_client(
     elapsed
 }
 
+async fn quinn_echo_client(
+    client: &quinn::Endpoint,
+    remote: SocketAddr,
+    data: &[u8],
+    iters: u64,
+) -> Duration {
+    let conn = client.connect(remote, "localhost").unwrap().await.unwrap();
+
+    let start = Instant::now();
+    let mut futures = (0..iters)
+        .map(|_| async {
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            futures_util::join!(
+                async {
+                    send.write_all(data).await.unwrap();
+                    send.finish().unwrap();
+                },
+                async {
+                    recv.read_to_end(usize::MAX).await.unwrap();
+                }
+            );
+        })
+        .collect::<FuturesUnordered<_>>();
+    while futures.next().await.is_some() {}
+
+    let elapsed = start.elapsed();
+
+    conn.close(0u32.into(), b"done");
+    conn.closed().await;
+
+    elapsed
+}
+
 fn main() {
     let mut c = Criterion::default().configure_from_args();
 
@@ -182,7 +265,8 @@ fn main() {
     let key_der: rustls::pki_types::PrivateKeyDer = signing_key.serialize_der().try_into().unwrap();
 
     let comnoq_server = start_comnoq_server(cert.clone(), key_der.clone_key());
-    let noq_server = start_noq_server(cert.clone(), key_der);
+    let noq_server = start_noq_server(cert.clone(), key_der.clone_key());
+    let quinn_server = start_quinn_server(cert.clone(), key_der);
 
     let compio_rt = compio::runtime::Runtime::new().unwrap();
     let comnoq_client = compio_rt.block_on(async {
@@ -201,9 +285,22 @@ fn main() {
         .unwrap();
     let noq_client = tokio_rt.block_on(async {
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(cert).unwrap();
+        roots.add(cert.clone()).unwrap();
         let client_config = noq::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
         let client = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        client.set_default_client_config(client_config);
+        client
+    });
+    let quinn_client = tokio_rt.block_on(async {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let client_crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        ));
+        let mut client = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
         client.set_default_client_config(client_config);
         client
     });
@@ -217,7 +314,11 @@ fn main() {
     let mut g = c.benchmark_group("quic-echo");
     g.throughput(Throughput::Bytes((DATA_SIZE * 2) as u64));
 
-    for (server_name, remote) in [("comnoq-server", comnoq_server), ("noq-server", noq_server)] {
+    for (server_name, remote) in [
+        ("comnoq-server", comnoq_server),
+        ("noq-server", noq_server),
+        ("quinn-server", quinn_server),
+    ] {
         g.bench_function(BenchmarkId::new("comnoq", server_name), |b| {
             b.to_async(&compio_rt)
                 .iter_custom(|iters| comnoq_echo_client(&comnoq_client, remote, &data, iters));
@@ -226,6 +327,11 @@ fn main() {
         g.bench_function(BenchmarkId::new("noq", server_name), |b| {
             b.to_async(&tokio_rt)
                 .iter_custom(|iters| noq_echo_client(&noq_client, remote, &data, iters));
+        });
+
+        g.bench_function(BenchmarkId::new("quinn", server_name), |b| {
+            b.to_async(&tokio_rt)
+                .iter_custom(|iters| quinn_echo_client(&quinn_client, remote, &data, iters));
         });
     }
     g.finish();
