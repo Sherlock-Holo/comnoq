@@ -818,7 +818,16 @@ impl Connection {
             .close(error_code, Bytes::copy_from_slice(reason));
     }
 
-    /// Wait for the TLS handshake to be confirmed.
+    /// Wait for the handshake to be confirmed.
+    ///
+    /// As a server, who must be authenticated by clients,
+    /// this happens when the handshake completes
+    /// upon receiving a TLS Finished message from the client.
+    /// In return, the server send a HANDSHAKE_DONE frame.
+    ///
+    /// As a client, this happens when receiving a HANDSHAKE_DONE frame.
+    /// At this point, the server has either accepted our authentication,
+    /// or, if client authentication is not required, accepted our lack of authentication.
     pub async fn handshake_confirmed(&self) -> Result<(), ConnectionError> {
         future::poll_fn(|cx| {
             let mut state = self.0.try_state()?;
@@ -1093,7 +1102,7 @@ impl Connection {
     ///
     /// See [`open_uni()`] for details.
     ///
-    /// [`open_uni()`]: crate::Connection::open_uni
+    /// [`open_uni()`]: Connection::open_uni
     pub async fn open_uni_wait(&self) -> Result<SendStream, ConnectionError> {
         let (stream, is_0rtt) =
             future::poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Uni)).await?;
@@ -1123,7 +1132,7 @@ impl Connection {
     ///
     /// See [`open_bi()`] for details.
     ///
-    /// [`open_bi()`]: crate::Connection::open_bi
+    /// [`open_bi()`]: Connection::open_bi
     pub async fn open_bi_wait(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
         let (stream, is_0rtt) =
             future::poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Bi)).await?;
@@ -1161,10 +1170,10 @@ impl Connection {
     /// `accept_bi()`. Calling [`open_bi()`] then waiting on the [`RecvStream`]
     /// without writing anything to [`SendStream`] will never succeed.
     ///
-    /// [`accept_bi()`]: crate::Connection::accept_bi
-    /// [`open_bi()`]: crate::Connection::open_bi
-    /// [`SendStream`]: crate::SendStream
-    /// [`RecvStream`]: crate::RecvStream
+    /// [`accept_bi()`]: Connection::accept_bi
+    /// [`open_bi()`]: Connection::open_bi
+    /// [`SendStream`]: SendStream
+    /// [`RecvStream`]: RecvStream
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
         let (stream, is_0rtt) = future::poll_fn(|cx| self.poll_accept_stream(cx, Dir::Bi)).await?;
         Ok((
@@ -1411,15 +1420,15 @@ pub(crate) mod h3_impl {
 
         fn poll_incoming_datagram(
             &mut self,
-            cx: &mut core::task::Context<'_>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Self::Buffer, ConnectionErrorIncoming>> {
             Poll::Ready(Ok(ready!(self.poll_recv_datagram(cx))?))
         }
     }
 
     impl<B: Buf> DatagramConnectionExt<B> for Connection {
-        type RecvDatagramHandler = Self;
         type SendDatagramHandler = Self;
+        type RecvDatagramHandler = Self;
 
         fn send_datagram_handler(&self) -> Self::SendDatagramHandler {
             self.clone()
@@ -1449,8 +1458,8 @@ pub(crate) mod h3_impl {
     where
         B: Buf,
     {
-        type RecvStream = RecvStream;
         type SendStream = SendStream<B>;
+        type RecvStream = RecvStream;
 
         fn split(self) -> (Self::SendStream, Self::RecvStream) {
             (self.send, self.recv)
@@ -1582,12 +1591,12 @@ pub(crate) mod h3_impl {
     where
         B: Buf,
     {
-        type OpenStreams = OpenStreams;
         type RecvStream = RecvStream;
+        type OpenStreams = OpenStreams;
 
         fn poll_accept_recv(
             &mut self,
-            cx: &mut std::task::Context<'_>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
             let (stream, is_0rtt) = ready!(self.poll_accept_stream(cx, Dir::Uni))?;
             Poll::Ready(Ok(RecvStream::new(self.0.clone(), stream, is_0rtt)))
@@ -1595,7 +1604,7 @@ pub(crate) mod h3_impl {
 
         fn poll_accept_bidi(
             &mut self,
-            cx: &mut std::task::Context<'_>,
+            cx: &mut Context<'_>,
         ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
             let (stream, is_0rtt) = ready!(self.poll_accept_stream(cx, Dir::Bi))?;
             Poll::Ready(Ok(BidiStream::new(self.0.clone(), stream, is_0rtt)))
