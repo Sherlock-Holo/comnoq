@@ -68,10 +68,7 @@ impl EndpointState {
             let mut resp_buf = Vec::new();
             match self.endpoint.handle(
                 now,
-                FourTuple {
-                    remote: meta.remote,
-                    local_ip: meta.local_ip,
-                },
+                FourTuple::new(meta.remote, meta.local_ip),
                 meta.ecn,
                 data,
                 &mut resp_buf,

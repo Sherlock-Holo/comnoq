@@ -135,7 +135,9 @@ impl Path {
         timeout: Option<Duration>,
     ) -> Result<Option<Duration>, ClosedPath> {
         let mut state = self.conn.state();
-        let previous = state.conn.set_path_max_idle_timeout(self.id, timeout)?;
+        let previous = state
+            .conn
+            .set_path_max_idle_timeout(Instant::now(), self.id, timeout)?;
         state.wake();
         Ok(previous)
     }
@@ -161,7 +163,7 @@ impl Path {
 
     /// Returns the peer's UDP address for this path.
     pub fn remote_address(&self) -> Result<SocketAddr, ClosedPath> {
-        Ok(self.conn.state().conn.network_path(self.id)?.remote)
+        Ok(self.conn.state().conn.network_path(self.id)?.remote())
     }
 
     /// Pings the peer over this path.

@@ -161,7 +161,7 @@ fn normalize_remote_address(
         .paths()
         .iter()
         .filter_map(|id| state.conn.network_path(*id).ok())
-        .map(|path| path.remote.is_ipv6())
+        .map(|path| path.remote().is_ipv6())
         .next()
         .unwrap_or_default();
     if addr.is_ipv6() && !ipv6 {
@@ -276,16 +276,13 @@ impl ConnectionInner {
 
     pub(crate) fn all_path_stats(&self) -> HashMap<PathId, PathStats> {
         let mut state = self.state.lock();
-        state
-            .conn
-            .paths()
-            .into_iter()
-            .filter_map(|id| {
-                let stats = state.conn.path_stats(id)?;
+        let mut stats = state.final_path_stats.clone();
+        stats.extend(state.conn.paths().into_iter().filter_map(|id| {
+            let stats = state.conn.path_stats(id)?;
 
-                Some((id, stats))
-            })
-            .collect()
+            Some((id, stats))
+        }));
+        stats
     }
 
     pub(crate) fn all_path_status(&self) -> HashMap<PathId, PathStatus> {
@@ -427,7 +424,7 @@ impl ConnectionInner {
                                 }
                             }
                             PathEvent::Discarded { id, path_stats } => {
-                                state.final_path_stats.insert(*id, *path_stats);
+                                state.final_path_stats.insert(*id, **path_stats);
                             }
                             PathEvent::RemoteStatus { .. } => {}
                         }
@@ -476,7 +473,7 @@ macro_rules! conn_fn {
                 .filter_map(|id| state.conn.network_path(*id).ok())
                 .next()
                 .unwrap()
-                .local_ip
+                .local_ip()
         }
 
         /// The peer's UDP address.
@@ -492,7 +489,7 @@ macro_rules! conn_fn {
                 .filter_map(|id| state.conn.network_path(*id).ok())
                 .next()
                 .unwrap()
-                .remote
+                .remote()
         }
 
         /// Current best estimate of this connection's latency (round-trip-time).
@@ -871,14 +868,10 @@ impl Connection {
             Err(err) => return OpenPath::rejected(err),
         };
         let (tx, rx) = flume::bounded(1);
-        let result = state.conn.open_path(
-            FourTuple {
-                remote: addr,
-                local_ip: None,
-            },
-            initial_status,
-            Instant::now(),
-        );
+        let result =
+            state
+                .conn
+                .open_path(FourTuple::new(addr, None), initial_status, Instant::now());
         match result {
             Ok(path_id) => {
                 state.open_path.insert(path_id, tx);

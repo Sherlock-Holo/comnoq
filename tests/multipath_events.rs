@@ -155,6 +155,79 @@ async fn handshake_confirmed_and_open_path_event() {
     server_endpoint.shutdown().await.unwrap();
 }
 
+#[compio::test]
+async fn discarded_path_stats_are_retained() {
+    let _guard = subscribe();
+
+    let mut transport = TransportConfig::default();
+    transport.max_concurrent_multipath_paths(2);
+    let (client_endpoint, server_endpoint) = endpoint_pair_with_transport(transport).await;
+    let server_addr = server_endpoint.local_addr().unwrap();
+
+    let (client, server) = join!(
+        async {
+            client_endpoint
+                .connect(server_addr, "localhost", None)
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        async {
+            server_endpoint
+                .wait_incoming()
+                .await
+                .unwrap()
+                .await
+                .unwrap()
+        },
+    );
+
+    client.handshake_confirmed().await.unwrap();
+    assert!(client.is_multipath_enabled());
+
+    let path_events = client.path_events();
+    let path = loop {
+        match client.open_path(server_addr, PathStatus::Available).await {
+            Ok(path) => break path,
+            Err(PathError::RemoteCidsExhausted) => {
+                compio::runtime::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => panic!("unexpected open_path error: {err:?}"),
+        }
+    };
+
+    loop {
+        let event = path_events.recv_async().await.unwrap();
+        if matches!(event, PathEvent::Opened { id } if id == path.id()) {
+            break;
+        }
+    }
+
+    path.close().unwrap();
+
+    loop {
+        let event = path_events.recv_async().await.unwrap();
+        if matches!(event, PathEvent::Discarded { id, .. } if id == path.id()) {
+            break;
+        }
+    }
+
+    assert!(
+        path.stats().is_some(),
+        "path handle should retain final stats after discard"
+    );
+    assert!(
+        client.all_path_stats().contains_key(&path.id()),
+        "aggregated path stats should include discarded paths with retained final stats"
+    );
+
+    drop(path);
+    drop(server);
+    drop(client);
+    client_endpoint.shutdown().await.unwrap();
+    server_endpoint.shutdown().await.unwrap();
+}
+
 #[cfg(linux_all)]
 #[compio::test]
 async fn handshake_confirmed_and_open_path_event_dual_stack() {
