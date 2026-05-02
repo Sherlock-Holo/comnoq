@@ -275,7 +275,7 @@ impl ConnectionInner {
     }
 
     pub(crate) fn all_path_stats(&self) -> HashMap<PathId, PathStats> {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         let mut stats = state.final_path_stats.clone();
         stats.extend(state.conn.paths().into_iter().filter_map(|id| {
             let stats = state.conn.path_stats(id)?;
@@ -283,6 +283,20 @@ impl ConnectionInner {
             Some((id, stats))
         }));
         stats
+    }
+
+    pub(crate) fn live_path_stats(&self) -> HashMap<PathId, PathStats> {
+        let mut state = self.state();
+        state
+            .conn
+            .paths()
+            .into_iter()
+            .filter_map(|id| {
+                let stats = state.conn.path_stats(id)?;
+
+                Some((id, stats))
+            })
+            .collect()
     }
 
     pub(crate) fn all_path_status(&self) -> HashMap<PathId, PathStatus> {
@@ -902,6 +916,14 @@ impl Connection {
     /// Returns all path stats.
     pub fn all_path_stats(&self) -> HashMap<PathId, PathStats> {
         self.0.all_path_stats()
+    }
+
+    /// Returns path statistics for paths that are still active in the QUIC stack.
+    ///
+    /// Discarded paths are omitted; their last recorded statistics are still available from
+    /// [`Self::path_stats`] (e.g. via a retained [`Path`] handle) and included in [`Self::all_path_stats`].
+    pub fn live_path_stats(&self) -> HashMap<PathId, PathStats> {
+        self.0.live_path_stats()
     }
 
     /// Returns all path status.

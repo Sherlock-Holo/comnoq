@@ -220,6 +220,10 @@ async fn discarded_path_stats_are_retained() {
         client.all_path_stats().contains_key(&path.id()),
         "aggregated path stats should include discarded paths with retained final stats"
     );
+    assert!(
+        !client.live_path_stats().contains_key(&path.id()),
+        "live path stats should exclude discarded paths"
+    );
 
     drop(path);
     drop(server);
