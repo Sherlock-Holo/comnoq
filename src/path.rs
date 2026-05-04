@@ -83,14 +83,31 @@ impl Future for OpenPath {
 }
 
 /// An open path in a multipath-enabled connection.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Path {
     id: PathId,
     conn: Shared<ConnectionInner>,
 }
 
+impl Clone for Path {
+    fn clone(&self) -> Self {
+        self.conn.state().increment_path_refs(self.id);
+        Self {
+            id: self.id,
+            conn: self.conn.clone(),
+        }
+    }
+}
+
+impl Drop for Path {
+    fn drop(&mut self) {
+        self.conn.state().decrement_path_refs(self.id);
+    }
+}
+
 impl Path {
     pub(crate) fn new_unchecked(conn: Shared<ConnectionInner>, id: PathId) -> Self {
+        conn.state().increment_path_refs(id);
         Self { id, conn }
     }
 
