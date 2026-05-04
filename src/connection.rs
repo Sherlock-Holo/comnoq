@@ -60,6 +60,7 @@ pub(crate) struct ConnectionState {
     observed_external_addr: Option<SocketAddr>,
     nat_traversal_updates: Vec<Sender<n0_nat_traversal::Event>>,
     final_path_stats: HashMap<PathId, PathStats>,
+    path_refs: HashMap<PathId, usize>,
     pub(crate) writable: HashMap<StreamId, Waker>,
     pub(crate) readable: HashMap<StreamId, Waker>,
     pub(crate) stopped: HashMap<StreamId, Waker>,
@@ -121,6 +122,20 @@ impl ConnectionState {
         self.conn
             .path_stats(path_id)
             .or_else(|| self.final_path_stats.get(&path_id).copied())
+    }
+
+    pub(crate) fn increment_path_refs(&mut self, path_id: PathId) {
+        *self.path_refs.entry(path_id).or_default() += 1;
+    }
+
+    pub(crate) fn decrement_path_refs(&mut self, path_id: PathId) {
+        if let Some(refs) = self.path_refs.get_mut(&path_id) {
+            *refs = refs.saturating_sub(1);
+            if *refs == 0 {
+                self.path_refs.remove(&path_id);
+                self.final_path_stats.remove(&path_id);
+            }
+        }
     }
 }
 
@@ -222,6 +237,7 @@ impl ConnectionInner {
                 observed_external_addr: None,
                 nat_traversal_updates: Vec::new(),
                 final_path_stats: HashMap::default(),
+                path_refs: HashMap::default(),
                 writable: HashMap::default(),
                 readable: HashMap::default(),
                 stopped: HashMap::default(),
@@ -255,16 +271,17 @@ impl ConnectionInner {
     }
 
     pub(crate) fn paths(inner: &Shared<ConnectionInner>) -> Vec<Path> {
-        let state = inner.state.lock();
-        let path_ids = state.conn.paths();
-
-        path_ids
+        let valid_ids = {
+            let state = inner.state.lock();
+            let path_ids = state.conn.paths();
+            path_ids
+                .into_iter()
+                .filter(|id| state.conn.path_status(*id).is_ok())
+                .collect::<Vec<_>>()
+        };
+        valid_ids
             .into_iter()
-            .filter_map(|id| {
-                state.conn.path_status(id).ok()?;
-
-                Some(Path::new_unchecked(inner.clone(), id))
-            })
+            .map(|id| Path::new_unchecked(inner.clone(), id))
             .collect()
     }
 
@@ -438,7 +455,9 @@ impl ConnectionInner {
                                 }
                             }
                             PathEvent::Discarded { id, path_stats } => {
-                                state.final_path_stats.insert(*id, **path_stats);
+                                if state.path_refs.contains_key(id) {
+                                    state.final_path_stats.insert(*id, **path_stats);
+                                }
                             }
                             PathEvent::RemoteStatus { .. } => {}
                         }
