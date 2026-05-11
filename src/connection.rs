@@ -505,8 +505,7 @@ macro_rules! conn_fn {
                 .iter()
                 .filter_map(|id| state.conn.network_path(*id).ok())
                 .next()
-                .unwrap()
-                .local_ip()
+                .and_then(|path| path.local_ip())
         }
 
         /// The peer's UDP address.
@@ -521,7 +520,7 @@ macro_rules! conn_fn {
                 .iter()
                 .filter_map(|id| state.conn.network_path(*id).ok())
                 .next()
-                .unwrap()
+                .expect("remote_address called on a connection with no paths")
                 .remote()
         }
 
@@ -738,7 +737,10 @@ impl Connection {
     /// Parameters negotiated during the handshake.
     #[cfg(rustls)]
     pub fn handshake_data(&mut self) -> Result<Box<HandshakeData>, ConnectionError> {
-        Ok(self.0.try_state()?.handshake_data().unwrap())
+        self.0
+            .try_state()?
+            .handshake_data()
+            .ok_or(ConnectionError::LocallyClosed)
     }
 
     /// Compute the maximum size of datagrams that may be passed to
