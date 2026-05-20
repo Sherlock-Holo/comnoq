@@ -21,13 +21,12 @@ async fn main() {
             .connect(
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 4433),
                 "localhost",
-                None,
             )
             .unwrap()
             .await
             .unwrap();
 
-        let (mut send, mut recv) = conn.open_bi().unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
         send.write(&[1, 2, 3]).await.unwrap();
         send.finish().unwrap();
 

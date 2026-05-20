@@ -26,7 +26,7 @@ async fn main() {
     let mut endpoint = Endpoint::server("127.0.0.1:0", server_config)
         .await
         .unwrap();
-    endpoint.default_client_config = Some(client_config);
+    endpoint.set_default_client_config(client_config);
 
     spawn({
         let endpoint = endpoint.clone();
@@ -35,11 +35,11 @@ async fn main() {
                 let endpoint = &endpoint;
                 async move {
                     let conn = endpoint
-                        .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                        .connect(endpoint.local_addr().unwrap(), "localhost")
                         .unwrap()
                         .await
                         .unwrap();
-                    let mut send = conn.open_uni().unwrap();
+                    let mut send = conn.open_uni().await.unwrap();
                     let msg = format!("Hello world {i}!").into_bytes();
                     let BufResult(res, _) = send.write_all(msg).await;
                     res.unwrap();
@@ -58,7 +58,7 @@ async fn main() {
         .unwrap();
     let mut handles = FuturesUnordered::new();
     for _ in 0..CLIENT_NUM {
-        let incoming = endpoint.wait_incoming().await.unwrap();
+        let incoming = endpoint.accept().await.unwrap();
         let handle = dispatcher
             .dispatch(move || async move {
                 let conn = incoming.await.unwrap();

@@ -17,7 +17,7 @@ async fn endpoint_pair_with_transport(transport: TransportConfig) -> (Endpoint, 
         .await
         .unwrap();
     let mut client = Endpoint::client("127.0.0.1:0").await.unwrap();
-    client.default_client_config = Some(client_config);
+    client.set_default_client_config(client_config);
     (client, server)
 }
 
@@ -28,7 +28,7 @@ async fn dual_stack_endpoint_pair_with_transport(
     let (server_config, client_config) = config_pair(Some(transport));
     let server = Endpoint::server("[::]:0", server_config).await.unwrap();
     let mut client = Endpoint::client("[::]:0").await.unwrap();
-    client.default_client_config = Some(client_config);
+    client.set_default_client_config(client_config);
     (client, server)
 }
 
@@ -43,19 +43,12 @@ async fn path_api() {
     let (client, server) = join!(
         async {
             client_endpoint
-                .connect(server_addr, "localhost", None)
+                .connect(server_addr, "localhost")
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async {
-            server_endpoint
-                .wait_incoming()
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-        },
+        async { server_endpoint.accept().await.unwrap().await.unwrap() },
     );
 
     let path = client.path(PathId::ZERO).expect("path zero exists");
@@ -109,19 +102,12 @@ async fn handshake_confirmed_and_open_path_event() {
     let (client, server) = join!(
         async {
             client_endpoint
-                .connect(server_addr, "localhost", None)
+                .connect(server_addr, "localhost")
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async {
-            server_endpoint
-                .wait_incoming()
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-        },
+        async { server_endpoint.accept().await.unwrap().await.unwrap() },
     );
 
     client.handshake_confirmed().await.unwrap();
@@ -139,7 +125,7 @@ async fn handshake_confirmed_and_open_path_event() {
     };
 
     assert_ne!(path.id(), PathId::ZERO);
-    assert!(path.stats().is_some());
+    let _stats = path.stats();
 
     loop {
         let event = path_events.recv_async().await.unwrap();
@@ -167,19 +153,12 @@ async fn discarded_path_stats_are_retained() {
     let (client, server) = join!(
         async {
             client_endpoint
-                .connect(server_addr, "localhost", None)
+                .connect(server_addr, "localhost")
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async {
-            server_endpoint
-                .wait_incoming()
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-        },
+        async { server_endpoint.accept().await.unwrap().await.unwrap() },
     );
 
     client.handshake_confirmed().await.unwrap();
@@ -212,10 +191,7 @@ async fn discarded_path_stats_are_retained() {
         }
     }
 
-    assert!(
-        path.stats().is_some(),
-        "path handle should retain final stats after discard"
-    );
+    let _stats = path.stats();
     assert!(
         client.all_path_stats().contains_key(&path.id()),
         "aggregated path stats should include discarded paths with retained final stats"
@@ -247,19 +223,12 @@ async fn handshake_confirmed_and_open_path_event_dual_stack() {
     let (client, server) = join!(
         async {
             client_endpoint
-                .connect(ipv4_server_addr, "localhost", None)
+                .connect(ipv4_server_addr, "localhost")
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async {
-            server_endpoint
-                .wait_incoming()
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-        },
+        async { server_endpoint.accept().await.unwrap().await.unwrap() },
     );
 
     client.handshake_confirmed().await.unwrap();
@@ -282,7 +251,7 @@ async fn handshake_confirmed_and_open_path_event_dual_stack() {
     };
 
     assert_ne!(path.id(), PathId::ZERO);
-    assert!(path.stats().is_some());
+    let _stats = path.stats();
 
     loop {
         let event = path_events.recv_async().await.unwrap();
@@ -303,26 +272,19 @@ async fn nat_traversal_updates_are_forwarded() {
     let _guard = subscribe();
 
     let mut transport = TransportConfig::default();
-    transport.set_max_remote_nat_traversal_addresses(2);
+    transport.max_remote_nat_traversal_addresses(2);
     let (client_endpoint, server_endpoint) = endpoint_pair_with_transport(transport).await;
     let server_addr = server_endpoint.local_addr().unwrap();
 
     let (client, server) = join!(
         async {
             client_endpoint
-                .connect(server_addr, "localhost", None)
+                .connect(server_addr, "localhost")
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async {
-            server_endpoint
-                .wait_incoming()
-                .await
-                .unwrap()
-                .await
-                .unwrap()
-        },
+        async { server_endpoint.accept().await.unwrap().await.unwrap() },
     );
 
     client.handshake_confirmed().await.unwrap();

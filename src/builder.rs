@@ -157,7 +157,7 @@ impl ClientBuilder<rustls::ClientConfig> {
     /// See [`Endpoint::client`] for more information.
     pub async fn bind(self, addr: impl ToSocketAddrsAsync) -> io::Result<Endpoint> {
         let mut endpoint = Endpoint::client(addr).await?;
-        endpoint.default_client_config = Some(self.build());
+        endpoint.set_default_client_config(self.build());
         Ok(endpoint)
     }
 }

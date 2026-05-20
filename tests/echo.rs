@@ -26,7 +26,7 @@ async fn echo((mut send, mut recv): (SendStream, RecvStream)) {
         // These are 32 buffers, for reading approximately 32kB at once
         let mut bufs: [Bytes; 32] = array::from_fn(|_| Bytes::new());
 
-        match recv.read_chunks(&mut bufs).await.unwrap() {
+        match recv.read_many_chunks(&mut bufs).await.unwrap() {
             Some(n) => {
                 send.write_all_chunks(&mut bufs[..n]).await.unwrap();
             }
@@ -68,7 +68,7 @@ async fn run_echo(args: EchoArgs) {
 
     join!(
         async {
-            let conn = server.wait_incoming().await.unwrap().await.unwrap();
+            let conn = server.accept().await.unwrap().await.unwrap();
 
             while let Ok(stream) = conn.accept_bi().await {
                 compio::runtime::spawn(echo(stream)).detach();
@@ -76,17 +76,13 @@ async fn run_echo(args: EchoArgs) {
         },
         async {
             let conn = client
-                .connect(
-                    server.local_addr().unwrap(),
-                    "localhost",
-                    Some(client_config),
-                )
+                .connect_with(client_config, server.local_addr().unwrap(), "localhost")
                 .unwrap()
                 .await
                 .unwrap();
 
             for _ in 0..args.nr_streams {
-                let (mut send, mut recv) = conn.open_bi_wait().await.unwrap();
+                let (mut send, mut recv) = conn.open_bi().await.unwrap();
                 let msg = gen_data(args.stream_size);
 
                 let (msg, (_, data)) = join!(

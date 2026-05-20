@@ -20,7 +20,7 @@ async fn main() {
         .await
         .unwrap();
 
-    if let Some(incoming) = endpoint.wait_incoming().await {
+    if let Some(incoming) = endpoint.accept().await {
         let conn = incoming.await.unwrap();
 
         let (mut send, mut recv) = conn.accept_bi().await.unwrap();

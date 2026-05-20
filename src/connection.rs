@@ -1,3 +1,7 @@
+#[cfg(not(feature = "sync"))]
+use std::rc::Weak as WeakShared;
+#[cfg(feature = "sync")]
+use std::sync::Weak as WeakShared;
 use std::{
     collections::VecDeque,
     fmt::Debug,
@@ -59,6 +63,7 @@ pub(crate) struct ConnectionState {
     path_events: Vec<Sender<PathEvent>>,
     observed_external_addr: Option<SocketAddr>,
     nat_traversal_updates: Vec<Sender<n0_nat_traversal::Event>>,
+    on_closed: Vec<Sender<Closed>>,
     final_path_stats: HashMap<PathId, PathStats>,
     path_refs: HashMap<PathId, usize>,
     pub(crate) writable: HashMap<StreamId, Waker>,
@@ -68,7 +73,7 @@ pub(crate) struct ConnectionState {
 
 impl ConnectionState {
     fn terminate(&mut self, reason: ConnectionError) {
-        self.error = Some(reason);
+        self.error = Some(reason.clone());
         self.connected = false;
 
         if let Some(waker) = self.on_handshake_data.take() {
@@ -92,6 +97,13 @@ impl ConnectionState {
         wake_all_streams(&mut self.writable);
         wake_all_streams(&mut self.readable);
         wake_all_streams(&mut self.stopped);
+
+        if !self.on_closed.is_empty() {
+            let closed = Closed::new(self, reason);
+            for tx in self.on_closed.drain(..) {
+                let _ = tx.send(closed.clone());
+            }
+        }
     }
 
     fn close(&mut self, error_code: VarInt, reason: Bytes) {
@@ -236,6 +248,7 @@ impl ConnectionInner {
                 path_events: Vec::new(),
                 observed_external_addr: None,
                 nat_traversal_updates: Vec::new(),
+                on_closed: Vec::new(),
                 final_path_stats: HashMap::default(),
                 path_refs: HashMap::default(),
                 writable: HashMap::default(),
@@ -590,6 +603,92 @@ macro_rules! conn_fn {
     };
 }
 
+/// State of a [`Connection`] at the moment it was closed.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Closed {
+    /// The reason the connection was closed.
+    pub reason: ConnectionError,
+    /// Aggregate connection statistics at the moment of close.
+    pub stats: ConnectionStats,
+    /// Per-path statistics for every path the connection knew about at close time.
+    pub path_stats: Vec<(PathId, PathStats)>,
+}
+
+impl Closed {
+    fn new(state: &mut ConnectionState, reason: ConnectionError) -> Self {
+        let stats = state.conn.stats();
+        let mut path_stats = Vec::new();
+        path_stats.extend(
+            state
+                .conn
+                .paths()
+                .into_iter()
+                .filter_map(|id| state.conn.path_stats(id).map(|stats| (id, stats))),
+        );
+        path_stats.extend(
+            state
+                .final_path_stats
+                .iter()
+                .map(|(id, stats)| (*id, *stats)),
+        );
+        Self {
+            reason,
+            stats,
+            path_stats,
+        }
+    }
+}
+
+/// Future returned by [`Connection::on_closed`].
+#[derive(Debug)]
+pub struct OnClosed {
+    rx: Receiver<Closed>,
+    conn: WeakConnectionHandle,
+}
+
+impl Future for OnClosed {
+    type Output = Closed;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let fut = self.rx.recv_async();
+        futures_util::pin_mut!(fut);
+        fut.poll(cx)
+            .map(|closed| closed.expect("on_closed sender is kept until connection termination"))
+    }
+}
+
+impl Drop for OnClosed {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.upgrade_inner() {
+            conn.state().on_closed.retain(|tx| !tx.is_disconnected());
+        }
+    }
+}
+
+/// Future that completes when a connection is fully established.
+#[derive(Debug, Clone)]
+pub struct ZeroRttAccepted(Shared<ConnectionInner>);
+
+impl Future for ZeroRttAccepted {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.0.state();
+        if state.connected {
+            return Poll::Ready(state.conn.accepted_0rtt());
+        }
+        if state.error.is_some() {
+            return Poll::Ready(false);
+        }
+        match &state.on_connected {
+            Some(waker) if waker.will_wake(cx.waker()) => {}
+            _ => state.on_connected = Some(cx.waker().clone()),
+        }
+        Poll::Pending
+    }
+}
+
 /// In-progress connection attempt future
 #[derive(Debug)]
 #[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
@@ -642,7 +741,7 @@ impl Connecting {
     /// sending 0/0.5-RTT data. If so, the returned [`Connection`] can be used
     /// to send application data without waiting for the rest of the handshake
     /// to complete, at the cost of weakened cryptographic security guarantees.
-    /// The [`Connection::accepted_0rtt`] method resolves when the handshake
+    /// The returned [`ZeroRttAccepted`] future resolves when the handshake
     /// does complete, at which point subsequently opened streams and written
     /// data will have full cryptographic protection.
     ///
@@ -653,10 +752,10 @@ impl Connecting {
     /// [`crypto::ClientConfig`][crate::crypto::ClientConfig] attempts to resume
     /// a previous TLS session. However, **the remote endpoint may not actually
     /// _accept_ the 0-RTT data**--yet still accept the connection attempt in
-    /// general. This possibility is conveyed through the
-    /// [`Connection::accepted_0rtt`] method--when the handshake completes, it
-    /// resolves to true if the 0-RTT data was accepted and false if it was
-    /// rejected. If it was rejected, the existence of streams opened and other
+    /// general. This possibility is conveyed through the returned
+    /// [`ZeroRttAccepted`] future--when the handshake completes, it resolves to
+    /// true if the 0-RTT data was accepted and false if it was rejected. If it
+    /// was rejected, the existence of streams opened and other
     /// application data sent prior to the handshake completing will not be
     /// conveyed to the remote application, and local operations on them will
     /// return `ZeroRttRejected` errors.
@@ -669,8 +768,8 @@ impl Connecting {
     /// ## Incoming
     ///
     /// For incoming connections, conversion to 0.5-RTT will always fully
-    /// succeed. `into_0rtt` will always return `Ok` and
-    /// [`Connection::accepted_0rtt`] will always resolve to true.
+    /// succeed. `into_0rtt` will always return `Ok` and the returned
+    /// [`ZeroRttAccepted`] future will always resolve to true.
     ///
     /// ## Security
     ///
@@ -682,13 +781,13 @@ impl Connecting {
     /// which may be sent before TLS client authentication has occurred, and
     /// should therefore not be used to send data for which client
     /// authentication is being used.
-    pub fn into_0rtt(self) -> Result<Connection, Self> {
+    pub fn into_0rtt(self) -> Result<(Connection, ZeroRttAccepted), Self> {
         let is_ok = {
             let state = self.0.state();
             state.conn.has_0rtt() || state.conn.side().is_server()
         };
         if is_ok {
-            Ok(Connection(self.0.clone()))
+            Ok((Connection(self.0.clone()), ZeroRttAccepted(self.0.clone())))
         } else {
             Err(self)
         }
@@ -724,8 +823,51 @@ impl Drop for Connecting {
 #[derive(Debug, Clone)]
 pub struct Connection(Shared<ConnectionInner>);
 
+/// Weak handle for a [`Connection`] that does not keep it alive.
+#[derive(Debug, Clone)]
+pub struct WeakConnectionHandle(WeakShared<ConnectionInner>);
+
+impl WeakConnectionHandle {
+    pub(crate) fn new(conn: &Shared<ConnectionInner>) -> Self {
+        Self(Shared::downgrade(conn))
+    }
+
+    pub(crate) fn upgrade_inner(&self) -> Option<Shared<ConnectionInner>> {
+        self.0.upgrade()
+    }
+
+    /// Upgrades to a [`Connection`].
+    pub fn upgrade(&self) -> Option<Connection> {
+        self.upgrade_inner().map(Connection)
+    }
+
+    pub(crate) fn is_same_connection(&self, other: &Self) -> bool {
+        WeakShared::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl Connection {
     conn_fn!();
+
+    /// Returns a weak reference to the inner connection struct.
+    pub fn weak_handle(&self) -> WeakConnectionHandle {
+        WeakConnectionHandle::new(&self.0)
+    }
+
+    /// Wait for the connection to be closed without keeping a strong reference to it.
+    pub fn on_closed(&self) -> OnClosed {
+        let (tx, rx) = flume::bounded(1);
+        let mut state = self.0.state();
+        if let Some(reason) = state.error.clone() {
+            let _ = tx.send(Closed::new(&mut state, reason));
+        } else {
+            state.on_closed.push(tx);
+        }
+        OnClosed {
+            rx,
+            conn: self.weak_handle(),
+        }
+    }
 
     /// Update traffic keys spontaneously
     ///
@@ -1036,7 +1178,7 @@ impl Connection {
     }
 
     /// Receive an application datagram.
-    pub async fn recv_datagram(&self) -> Result<Bytes, ConnectionError> {
+    pub async fn read_datagram(&self) -> Result<Bytes, ConnectionError> {
         future::poll_fn(|cx| self.poll_recv_datagram(cx)).await
     }
 
@@ -1118,58 +1260,44 @@ impl Connection {
         }
     }
 
-    /// Initiate a new outgoing unidirectional stream.
+    /// Initiate a new outgoing unidirectional stream immediately.
     ///
-    /// Streams are cheap and instantaneous to open. As a consequence, the peer
-    /// won't be notified that a stream has been opened until the stream is
-    /// actually used.
-    pub fn open_uni(&self) -> Result<SendStream, OpenStreamError> {
-        if let Poll::Ready((stream, is_0rtt)) = self.poll_open_stream(None, Dir::Uni)? {
-            Ok(SendStream::new(self.0.clone(), stream, is_0rtt))
-        } else {
-            Err(OpenStreamError::StreamsExhausted)
+    /// Returns [`OpenStreamError::StreamsExhausted`] instead of waiting if stream ID flow control
+    /// does not currently allow opening another stream.
+    pub fn try_open_uni(&self) -> Result<SendStream, OpenStreamError> {
+        match self.poll_open_stream(None, Dir::Uni) {
+            Poll::Ready(Ok((stream, is_0rtt))) => {
+                Ok(SendStream::new(self.0.clone(), stream, is_0rtt))
+            }
+            Poll::Ready(Err(e)) => Err(e.into()),
+            Poll::Pending => Err(OpenStreamError::StreamsExhausted),
         }
     }
 
     /// Initiate a new outgoing unidirectional stream.
-    ///
-    /// Unlike [`open_uni()`], this method will wait for the connection to allow
-    /// a new stream to be opened.
-    ///
-    /// See [`open_uni()`] for details.
-    ///
-    /// [`open_uni()`]: Connection::open_uni
-    pub async fn open_uni_wait(&self) -> Result<SendStream, ConnectionError> {
+    pub async fn open_uni(&self) -> Result<SendStream, ConnectionError> {
         let (stream, is_0rtt) =
             future::poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Uni)).await?;
         Ok(SendStream::new(self.0.clone(), stream, is_0rtt))
     }
 
-    /// Initiate a new outgoing bidirectional stream.
+    /// Initiate a new outgoing bidirectional stream immediately.
     ///
-    /// Streams are cheap and instantaneous to open. As a consequence, the peer
-    /// won't be notified that a stream has been opened until the stream is
-    /// actually used.
-    pub fn open_bi(&self) -> Result<(SendStream, RecvStream), OpenStreamError> {
-        if let Poll::Ready((stream, is_0rtt)) = self.poll_open_stream(None, Dir::Bi)? {
-            Ok((
+    /// Returns [`OpenStreamError::StreamsExhausted`] instead of waiting if stream ID flow control
+    /// does not currently allow opening another stream.
+    pub fn try_open_bi(&self) -> Result<(SendStream, RecvStream), OpenStreamError> {
+        match self.poll_open_stream(None, Dir::Bi) {
+            Poll::Ready(Ok((stream, is_0rtt))) => Ok((
                 SendStream::new(self.0.clone(), stream, is_0rtt),
                 RecvStream::new(self.0.clone(), stream, is_0rtt),
-            ))
-        } else {
-            Err(OpenStreamError::StreamsExhausted)
+            )),
+            Poll::Ready(Err(e)) => Err(e.into()),
+            Poll::Pending => Err(OpenStreamError::StreamsExhausted),
         }
     }
 
     /// Initiate a new outgoing bidirectional stream.
-    ///
-    /// Unlike [`open_bi()`], this method will wait for the connection to allow
-    /// a new stream to be opened.
-    ///
-    /// See [`open_bi()`] for details.
-    ///
-    /// [`open_bi()`]: Connection::open_bi
-    pub async fn open_bi_wait(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
+    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
         let (stream, is_0rtt) =
             future::poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Bi)).await?;
         Ok((
@@ -1216,28 +1344,6 @@ impl Connection {
             SendStream::new(self.0.clone(), stream, is_0rtt),
             RecvStream::new(self.0.clone(), stream, is_0rtt),
         ))
-    }
-
-    /// Wait for the connection to be fully established.
-    ///
-    /// For clients, the resulting value indicates if 0-RTT was accepted. For
-    /// servers, the resulting value is meaningless.
-    pub async fn accepted_0rtt(&self) -> Result<bool, ConnectionError> {
-        future::poll_fn(|cx| {
-            let mut state = self.0.try_state()?;
-
-            if state.connected {
-                return Poll::Ready(Ok(state.conn.accepted_0rtt()));
-            }
-
-            match &state.on_connected {
-                Some(waker) if waker.will_wake(cx.waker()) => {}
-                _ => state.on_connected = Some(cx.waker().clone()),
-            }
-
-            Poll::Pending
-        })
-        .await
     }
 }
 

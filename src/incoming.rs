@@ -2,11 +2,12 @@ use std::{
     future::{Future, IntoFuture},
     net::{IpAddr, SocketAddr},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use futures_util::FutureExt;
-use noq_proto::{ConnectionId, ServerConfig};
+use noq_proto::{ConnectionId, DecryptedInitial, ServerConfig};
 use thiserror::Error;
 
 use crate::{Connecting, Connection, ConnectionError, EndpointRef};
@@ -41,7 +42,7 @@ impl Incoming {
     /// [`accept()`]: Incoming::accept
     pub fn accept_with(
         mut self,
-        server_config: ServerConfig,
+        server_config: Arc<ServerConfig>,
     ) -> Result<Connecting, ConnectionError> {
         let inner = self.0.take().unwrap();
         Ok(inner.endpoint.accept(inner.incoming, Some(server_config))?)
@@ -104,6 +105,11 @@ impl Incoming {
     /// The original destination CID when initiating the connection
     pub fn orig_dst_cid(&self) -> ConnectionId {
         self.0.as_ref().unwrap().incoming.orig_dst_cid()
+    }
+
+    /// Decrypt the Initial packet payload.
+    pub fn decrypt(&self) -> Option<DecryptedInitial> {
+        self.0.as_ref()?.incoming.decrypt()
     }
 }
 

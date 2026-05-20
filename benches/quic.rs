@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use compio::buf::bytes::Bytes;
+use compio::{buf::bytes::Bytes, io::AsyncWriteExt};
 use criterion::{BenchmarkId, Criterion, Throughput};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use rand::{Rng, rng};
@@ -22,7 +22,7 @@ macro_rules! tokio_spawn {
 }
 
 macro_rules! echo_server_impl {
-    ($spawn:ident, $incoming:expr) => {
+    ($spawn:ident, $incoming:expr, $read_chunks:ident) => {
         let Ok(conn) = $incoming.await else {
             continue;
         };
@@ -33,7 +33,7 @@ macro_rules! echo_server_impl {
                         // These are 32 buffers, for reading approximately 32kB at once
                         let mut bufs: [Bytes; 32] = std::array::from_fn(|_| Bytes::new());
 
-                        if let Ok(Some(n)) = recv.read_chunks(&mut bufs).await {
+                        if let Ok(Some(n)) = recv.$read_chunks(&mut bufs).await {
                             if send.write_all_chunks(&mut bufs[..n]).await.is_err() {
                                 break;
                             }
@@ -65,8 +65,8 @@ fn start_comnoq_server(
 
             tx.send(server.local_addr().unwrap()).unwrap();
 
-            while let Some(incoming) = server.wait_incoming().await {
-                echo_server_impl!(compio_spawn, incoming);
+            while let Some(incoming) = server.accept().await {
+                echo_server_impl!(compio_spawn, incoming, read_many_chunks);
             }
         });
     });
@@ -94,7 +94,7 @@ fn start_noq_server(
                 tx.send(server.local_addr().unwrap()).unwrap();
 
                 while let Some(incoming) = server.accept().await {
-                    echo_server_impl!(tokio_spawn, incoming);
+                    echo_server_impl!(tokio_spawn, incoming, read_many_chunks);
                 }
             });
     });
@@ -158,20 +158,50 @@ async fn comnoq_echo_client(
     data: &[u8],
     iters: u64,
 ) -> Duration {
-    let conn = client
-        .connect(remote, "localhost", None)
-        .unwrap()
-        .await
-        .unwrap();
+    let conn = client.connect(remote, "localhost").unwrap().await.unwrap();
 
     let start = Instant::now();
     let mut futures = (0..iters)
         .map(|_| async {
-            let (send, mut recv) = conn.open_bi_wait().await.unwrap();
+            let (send, mut recv) = conn.open_bi().await.unwrap();
             let mut send = send.into_compat();
             futures_util::join!(
                 async {
                     send.write_all(data).await.unwrap();
+                    send.finish().unwrap();
+                },
+                async {
+                    recv.read_to_end(vec![]).await.unwrap();
+                }
+            );
+        })
+        .collect::<FuturesUnordered<_>>();
+    while futures.next().await.is_some() {}
+
+    let elapsed = start.elapsed();
+
+    conn.close(0u32.into(), b"done");
+    conn.closed().await;
+
+    elapsed
+}
+
+async fn comnoq_echo_client_native(
+    client: &comnoq::Endpoint,
+    remote: SocketAddr,
+    data: &Bytes,
+    iters: u64,
+) -> Duration {
+    let conn = client.connect(remote, "localhost").unwrap().await.unwrap();
+
+    let start = Instant::now();
+    let mut futures = (0..iters)
+        .map(|_| async {
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            futures_util::join!(
+                async {
+                    let (res, _) = send.write_all(data.clone()).await.into();
+                    res.unwrap();
                     send.finish().unwrap();
                 },
                 async {
@@ -310,6 +340,7 @@ fn main() {
     let mut rng = rng();
     let mut data = vec![0u8; DATA_SIZE];
     rng.fill_bytes(&mut data);
+    let data_bytes = Bytes::copy_from_slice(&data);
 
     let mut g = c.benchmark_group("quic-echo");
     g.throughput(Throughput::Bytes((DATA_SIZE * 2) as u64));
@@ -322,6 +353,12 @@ fn main() {
         g.bench_function(BenchmarkId::new("comnoq", server_name), |b| {
             b.to_async(&compio_rt)
                 .iter_custom(|iters| comnoq_echo_client(&comnoq_client, remote, &data, iters));
+        });
+
+        g.bench_function(BenchmarkId::new("comnoq-native", server_name), |b| {
+            b.to_async(&compio_rt).iter_custom(|iters| {
+                comnoq_echo_client_native(&comnoq_client, remote, &data_bytes, iters)
+            });
         });
 
         g.bench_function(BenchmarkId::new("noq", server_name), |b| {

@@ -50,7 +50,7 @@ async fn main() {
 
     {
         println!("Connecting to {host} at {remote}");
-        let conn = endpoint.connect(remote, host, None).unwrap().await.unwrap();
+        let conn = endpoint.connect(remote, host).unwrap().await.unwrap();
 
         let (mut conn, mut send_req) = comnoq::h3::client::new(conn).await.unwrap();
         let handle = compio::runtime::spawn(async move { conn.wait_idle().await });

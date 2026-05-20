@@ -18,12 +18,12 @@ pub use noq_proto::QlogConfig;
 pub use noq_proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosePathError, ClosedPath,
     ClosedStream, ConfigError, ConnectError, ConnectionClose, ConnectionId, ConnectionIdGenerator,
-    ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
-    MtuDiscoveryConfig, MultipathNotNegotiated, NoneTokenLog, NoneTokenStore, PathAbandonReason,
-    PathError, PathEvent, PathId, PathStats, PathStatus, ServerConfig, SetPathStatusError, Side,
-    StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore,
-    Transmit, TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
-    VarIntBoundsExceeded, Written, congestion, crypto, n0_nat_traversal,
+    ConnectionStats, DecryptedInitial, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType,
+    IdleTimeout, MtuDiscoveryConfig, MultipathNotNegotiated, NoneTokenLog, NoneTokenStore,
+    PathAbandonReason, PathError, PathEvent, PathId, PathStats, PathStatus, ServerConfig,
+    SetPathStatusError, Side, StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache,
+    TokenReuseError, TokenStore, Transmit, TransportConfig, TransportErrorCode, UdpStats,
+    ValidationTokenConfig, VarInt, VarIntBoundsExceeded, congestion, crypto, n0_nat_traversal,
 };
 
 #[cfg(rustls)]
@@ -38,11 +38,14 @@ mod socket;
 
 #[cfg(rustls)]
 pub use builder::{ClientBuilder, ServerBuilder};
-pub use connection::{Connecting, Connection, ConnectionError, OpenStreamError, SendDatagramError};
-pub use endpoint::{Endpoint, EndpointStats};
+pub use connection::{
+    Closed, Connecting, Connection, ConnectionError, OnClosed, OpenStreamError, SendDatagramError,
+    WeakConnectionHandle, ZeroRttAccepted,
+};
+pub use endpoint::{Accept, Endpoint, EndpointStats};
 pub use incoming::{Incoming, IncomingFuture};
-pub use path::{AddressDiscovery, OpenPath, Path};
-pub use recv_stream::{ReadError, ReadExactError, RecvStream, ResetError};
+pub use path::{AddressDiscovery, OpenPath, Path, WeakPathHandle};
+pub use recv_stream::{ReadError, ReadExactError, RecvStream, ResetError, UnorderedRecvStream};
 pub use send_stream::{SendStream, StoppedError, WriteError};
 #[cfg(feature = "sync")]
 pub(crate) use synchrony::sync;

@@ -28,7 +28,7 @@ async fn ip_blocking() {
         let mut wait_fut = std::pin::pin!(wait_fut);
         loop {
             let incoming = futures_util::select! {
-                 incoming = server.wait_incoming().fuse() => incoming.unwrap(),
+                 incoming = server.accept().fuse() => incoming.unwrap(),
                  _ = wait_fut.as_mut() => break,
             };
             if incoming.remote_address() == client1_addr {
@@ -43,13 +43,13 @@ async fn ip_blocking() {
     });
 
     let e = client1
-        .connect(server_addr, "localhost", Some(client_config.clone()))
+        .connect_with(client_config.clone(), server_addr, "localhost")
         .unwrap()
         .await
         .unwrap_err();
     assert!(matches!(e, ConnectionError::ConnectionClosed(_)));
     client2
-        .connect(server_addr, "localhost", Some(client_config))
+        .connect_with(client_config, server_addr, "localhost")
         .unwrap()
         .await
         .unwrap();
@@ -73,30 +73,38 @@ async fn stream_id_flow_control() {
     let mut endpoint = Endpoint::server("127.0.0.1:0", server_config)
         .await
         .unwrap();
-    endpoint.default_client_config = Some(client_config);
+    endpoint.set_default_client_config(client_config);
 
     let (conn1, conn2) = join!(
         async {
             endpoint
-                .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                .connect(endpoint.local_addr().unwrap(), "localhost")
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async { endpoint.wait_incoming().await.unwrap().await.unwrap() },
+        async { endpoint.accept().await.unwrap().await.unwrap() },
     );
 
-    // If `open_uni_wait` doesn't get unblocked when the previous stream is dropped,
+    let first = conn1.try_open_uni().unwrap();
+    assert!(matches!(
+        conn1.try_open_uni(),
+        Err(OpenStreamError::StreamsExhausted)
+    ));
+    drop(first);
+    conn2.accept_uni().await.unwrap();
+
+    // If `open_uni` doesn't get unblocked when the previous stream is dropped,
     // this will time out.
     join!(
         async {
-            conn1.open_uni_wait().await.unwrap();
+            conn1.open_uni().await.unwrap();
         },
         async {
-            conn1.open_uni_wait().await.unwrap();
+            conn1.open_uni().await.unwrap();
         },
         async {
-            conn1.open_uni_wait().await.unwrap();
+            conn1.open_uni().await.unwrap();
         },
         async {
             conn2.accept_uni().await.unwrap();

@@ -28,10 +28,10 @@ async fn handshake_timeout() {
 
     let start = Instant::now();
     match endpoint
-        .connect(
+        .connect_with(
+            client_config,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             "localhost",
-            Some(client_config),
         )
         .unwrap()
         .await
@@ -59,7 +59,6 @@ async fn close_endpoint() {
         .connect(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             "localhost",
-            None,
         )
         .unwrap();
     endpoint.close(0u32.into(), b"");
@@ -79,7 +78,7 @@ async fn endpoint() -> Endpoint {
     let mut endpoint = Endpoint::server("127.0.0.1:0", server_config)
         .await
         .unwrap();
-    endpoint.default_client_config = Some(client_config);
+    endpoint.set_default_client_config(client_config);
     endpoint
 }
 
@@ -93,8 +92,8 @@ async fn read_after_close() {
 
     join!(
         async {
-            let conn = endpoint.wait_incoming().await.unwrap().await.unwrap();
-            let mut s = conn.open_uni().unwrap();
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let mut s = conn.open_uni().await.unwrap();
             s.write_all(MSG).await.unwrap();
             s.finish().unwrap();
             // Wait for the stream to be closed, one way or another.
@@ -102,7 +101,7 @@ async fn read_after_close() {
         },
         async {
             let conn = endpoint
-                .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                .connect(endpoint.local_addr().unwrap(), "localhost")
                 .unwrap()
                 .await
                 .unwrap();
@@ -124,12 +123,12 @@ async fn export_keying_material() {
     let (conn1, conn2) = join!(
         async {
             endpoint
-                .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                .connect(endpoint.local_addr().unwrap(), "localhost")
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async { endpoint.wait_incoming().await.unwrap().await.unwrap() },
+        async { endpoint.accept().await.unwrap().await.unwrap() },
     );
     let mut buf1 = [0u8; 64];
     let mut buf2 = [0u8; 64];
@@ -159,8 +158,8 @@ async fn zero_rtt() {
     join!(
         async {
             for _ in 0..2 {
-                let conn = endpoint
-                    .wait_incoming()
+                let (conn, accepted_0rtt) = endpoint
+                    .accept()
                     .await
                     .unwrap()
                     .accept()
@@ -175,11 +174,11 @@ async fn zero_rtt() {
                         }
                     },
                     async {
-                        let mut send = conn.open_uni().unwrap();
+                        let mut send = conn.open_uni().await.unwrap();
                         send.write_all(MSG0).await.unwrap();
                         send.finish().unwrap();
-                        conn.accepted_0rtt().await.unwrap();
-                        let mut send = conn.open_uni().unwrap();
+                        accepted_0rtt.await;
+                        let mut send = conn.open_uni().await.unwrap();
                         send.write_all(MSG1).await.unwrap();
                         send.finish().unwrap();
                         // no need to wait for the stream to be closed due to
@@ -191,7 +190,7 @@ async fn zero_rtt() {
         async {
             {
                 let conn = endpoint
-                    .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                    .connect(endpoint.local_addr().unwrap(), "localhost")
                     .unwrap()
                     .into_0rtt()
                     .unwrap_err()
@@ -208,13 +207,13 @@ async fn zero_rtt() {
                 assert_eq!(buf, MSG1);
             }
 
-            let conn = endpoint
-                .connect(endpoint.local_addr().unwrap(), "localhost", None)
+            let (conn, accepted_0rtt) = endpoint
+                .connect(endpoint.local_addr().unwrap(), "localhost")
                 .unwrap()
                 .into_0rtt()
                 .unwrap();
 
-            let mut send = conn.open_uni().unwrap();
+            let mut send = conn.open_uni().await.unwrap();
             send.write_all(MSG0).await.unwrap();
             send.finish().unwrap();
 
@@ -222,7 +221,7 @@ async fn zero_rtt() {
             let (_, mut buf) = recv.read_to_end(vec![]).await.expect("read_to_end");
             assert_eq!(buf, MSG0);
 
-            assert!(conn.accepted_0rtt().await.unwrap());
+            assert!(accepted_0rtt.await);
 
             buf.clear();
             let mut recv = conn.accept_uni().await.unwrap();
@@ -246,24 +245,24 @@ async fn two_datagram_readers() {
     let (conn1, conn2) = join!(
         async {
             endpoint
-                .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                .connect(endpoint.local_addr().unwrap(), "localhost")
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async { endpoint.wait_incoming().await.unwrap().await.unwrap() },
+        async { endpoint.accept().await.unwrap().await.unwrap() },
     );
 
     let (tx, rx) = flume::bounded::<()>(1);
 
     let (a, b, _) = join!(
         async {
-            let x = conn1.recv_datagram().await.unwrap();
+            let x = conn1.read_datagram().await.unwrap();
             let _ = tx.try_send(());
             x
         },
         async {
-            let x = conn1.recv_datagram().await.unwrap();
+            let x = conn1.read_datagram().await.unwrap();
             let _ = tx.try_send(());
             x
         },
@@ -295,18 +294,18 @@ async fn try_recv_datagram() {
     let (conn1, conn2) = join!(
         async {
             endpoint
-                .connect(endpoint.local_addr().unwrap(), "localhost", None)
+                .connect(endpoint.local_addr().unwrap(), "localhost")
                 .unwrap()
                 .await
                 .unwrap()
         },
-        async { endpoint.wait_incoming().await.unwrap().await.unwrap() },
+        async { endpoint.accept().await.unwrap().await.unwrap() },
     );
 
     conn1.send_datagram_wait(MSG1.into()).await.unwrap();
     conn1.send_datagram_wait(MSG2.into()).await.unwrap();
 
-    assert_eq!(conn2.recv_datagram().await.unwrap(), MSG1);
+    assert_eq!(conn2.read_datagram().await.unwrap(), MSG1);
     assert_eq!(conn2.try_recv_datagram().unwrap().unwrap(), MSG2);
 
     drop(conn1);

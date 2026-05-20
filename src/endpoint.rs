@@ -6,7 +6,7 @@ use std::{
     mem::ManuallyDrop,
     net::{SocketAddr, SocketAddrV6},
     ops::Deref,
-    pin::pin,
+    pin::{Pin, pin},
     ptr,
     sync::Arc,
     task::{Context, Poll, Waker},
@@ -20,7 +20,7 @@ use compio::net::UdpSocket;
 use compio::runtime::JoinHandle;
 use compio_log::{Instrument, error};
 use flume::{Receiver, Sender, unbounded};
-use futures_util::{FutureExt, StreamExt, future, select, task::AtomicWaker};
+use futures_util::{FutureExt, StreamExt, select, task::AtomicWaker};
 use noq_proto::{
     ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointConfig,
     EndpointEvent, FourTuple, ServerConfig, Transmit, VarInt,
@@ -236,14 +236,14 @@ impl EndpointInner {
     pub(crate) fn accept(
         &self,
         incoming: noq_proto::Incoming,
-        server_config: Option<ServerConfig>,
+        server_config: Option<Arc<ServerConfig>>,
     ) -> Result<Connecting, ConnectionError> {
         let mut state = self.state.lock();
         let mut resp_buf = Vec::new();
         let now = Instant::now();
         match state
             .endpoint
-            .accept(incoming, now, &mut resp_buf, server_config.map(Arc::new))
+            .accept(incoming, now, &mut resp_buf, server_config)
         {
             Ok((handle, conn)) => {
                 state.stats.accepted_handshakes += 1;
@@ -323,6 +323,9 @@ impl EndpointInner {
                 },
             };
 
+            if state.is_idle() {
+                self.done.wake();
+            }
             if state.exit_on_idle && state.is_idle() {
                 break Ok(());
             }
@@ -409,7 +412,7 @@ impl Deref for EndpointRef {
 pub struct Endpoint {
     inner: EndpointRef,
     /// The client configuration used by `connect`
-    pub default_client_config: Option<ClientConfig>,
+    default_client_config: Option<ClientConfig>,
 }
 
 impl Endpoint {
@@ -482,32 +485,38 @@ impl Endpoint {
         self.inner.state.lock().stats
     }
 
-    /// Connect to a remote endpoint.
+    /// Get the next incoming connection attempt from a client.
+    pub fn accept(&self) -> Accept<'_> {
+        Accept { endpoint: self }
+    }
+
+    /// Set the client configuration used by `connect`.
+    pub fn set_default_client_config(&mut self, config: ClientConfig) {
+        self.default_client_config = Some(config);
+    }
+
+    /// Connect to a remote endpoint using the default client configuration.
     pub fn connect(
         &self,
         remote: SocketAddr,
         server_name: &str,
-        config: Option<ClientConfig>,
     ) -> Result<Connecting, ConnectError> {
-        let config = config
-            .or_else(|| self.default_client_config.clone())
+        let config = self
+            .default_client_config
+            .clone()
             .ok_or(ConnectError::NoDefaultClientConfig)?;
 
-        self.inner.connect(remote, server_name, config)
+        self.connect_with(config, remote, server_name)
     }
 
-    /// Wait for the next incoming connection attempt from a client.
-    ///
-    /// Yields [`Incoming`]s, or `None` if the endpoint is
-    /// [`close`](Self::close)d. [`Incoming`] can be `await`ed to obtain the
-    /// final [`Connection`](crate::Connection), or used to e.g. filter
-    /// connection attempts or force address validation, or converted into an
-    /// intermediate `Connecting` future which can be used to e.g. send 0.5-RTT
-    /// data.
-    pub async fn wait_incoming(&self) -> Option<Incoming> {
-        future::poll_fn(|cx| self.inner.state.lock().poll_incoming(cx))
-            .await
-            .map(|incoming| Incoming::new(incoming, self.inner.clone()))
+    /// Connect to a remote endpoint using a custom configuration.
+    pub fn connect_with(
+        &self,
+        config: ClientConfig,
+        remote: SocketAddr,
+        server_name: &str,
+    ) -> Result<Connecting, ConnectError> {
+        self.inner.connect(remote, server_name, config)
     }
 
     /// Replace the server configuration, affecting new incoming connections
@@ -552,6 +561,20 @@ impl Endpoint {
         state.incoming_wakers.drain(..).for_each(Waker::wake);
     }
 
+    /// Wait for all connections on the endpoint to be cleanly shut down.
+    pub async fn wait_idle(&self) {
+        poll_fn(|cx| {
+            let state = self.inner.state.lock();
+            if state.is_idle() {
+                Poll::Ready(())
+            } else {
+                self.inner.done.register(cx.waker());
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
     /// Gracefully shutdown the endpoint.
     ///
     /// Wait for all connections on the endpoint to be cleanly shut down and
@@ -570,5 +593,25 @@ impl Endpoint {
     /// [`close()`]: Endpoint::close
     pub async fn shutdown(self) -> io::Result<()> {
         self.inner.shutdown().await
+    }
+}
+
+/// Future produced by [`Endpoint::accept`].
+pub struct Accept<'a> {
+    endpoint: &'a Endpoint,
+}
+
+impl Future for Accept<'_> {
+    type Output = Option<Incoming>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.endpoint
+            .inner
+            .state
+            .lock()
+            .poll_incoming(cx)
+            .map(|incoming| {
+                incoming.map(|incoming| Incoming::new(incoming, self.endpoint.inner.clone()))
+            })
     }
 }

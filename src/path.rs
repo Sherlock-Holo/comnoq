@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -13,7 +13,7 @@ use noq_proto::{
     SetPathStatusError, TransportErrorCode,
 };
 
-use crate::{ConnectionInner, sync::shared::Shared};
+use crate::{ConnectionInner, WeakConnectionHandle, sync::shared::Shared};
 
 /// Future produced by [`crate::Connection::open_path`].
 #[derive(Debug)]
@@ -111,6 +111,15 @@ impl Path {
         Self { id, conn }
     }
 
+    /// Returns a weak handle for this path.
+    pub fn weak_handle(&self) -> WeakPathHandle {
+        self.conn.state().increment_path_refs(self.id);
+        WeakPathHandle {
+            id: self.id,
+            conn: WeakConnectionHandle::new(&self.conn),
+        }
+    }
+
     /// Returns this path's identifier.
     pub fn id(&self) -> PathId {
         self.id
@@ -122,16 +131,21 @@ impl Path {
     }
 
     /// Updates the local status for this path.
-    pub fn set_status(&self, status: PathStatus) -> Result<(), SetPathStatusError> {
+    ///
+    /// Returns the previous status of the path.
+    pub fn set_status(&self, status: PathStatus) -> Result<PathStatus, SetPathStatusError> {
         let mut state = self.conn.state();
-        state.conn.set_path_status(self.id, status)?;
+        let previous = state.conn.set_path_status(self.id, status)?;
         state.wake();
-        Ok(())
+        Ok(previous)
     }
 
     /// Returns statistics for this path.
-    pub fn stats(&self) -> Option<PathStats> {
-        self.conn.state().path_stats(self.id)
+    pub fn stats(&self) -> PathStats {
+        self.conn
+            .state()
+            .path_stats(self.id)
+            .expect("path stats are retained while Path or WeakPathHandle exists")
     }
 
     /// Closes this path locally.
@@ -183,6 +197,11 @@ impl Path {
         Ok(self.conn.state().conn.network_path(self.id)?.remote())
     }
 
+    /// Returns the local IP used for this path, if known.
+    pub fn local_ip(&self) -> Result<Option<IpAddr>, ClosedPath> {
+        Ok(self.conn.state().conn.network_path(self.id)?.local_ip())
+    }
+
     /// Pings the peer over this path.
     pub fn ping(&self) -> Result<(), ClosedPath> {
         let mut state = self.conn.state();
@@ -195,6 +214,54 @@ impl Path {
 impl PartialEq for Path {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id && Shared::ptr_eq(&self.conn, &other.conn)
+    }
+}
+
+/// Weak handle for a [`Path`] that does not keep the connection alive.
+#[derive(Debug)]
+pub struct WeakPathHandle {
+    id: PathId,
+    conn: WeakConnectionHandle,
+}
+
+impl Clone for WeakPathHandle {
+    fn clone(&self) -> Self {
+        if let Some(conn) = self.conn.upgrade_inner() {
+            conn.state().increment_path_refs(self.id);
+        }
+        Self {
+            id: self.id,
+            conn: self.conn.clone(),
+        }
+    }
+}
+
+impl Drop for WeakPathHandle {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.upgrade_inner() {
+            conn.state().decrement_path_refs(self.id);
+        }
+    }
+}
+
+impl PartialEq for WeakPathHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.conn.is_same_connection(&other.conn)
+    }
+}
+
+impl Eq for WeakPathHandle {}
+
+impl WeakPathHandle {
+    /// Returns this path's identifier.
+    pub fn id(&self) -> PathId {
+        self.id
+    }
+
+    /// Upgrades to a [`Path`].
+    pub fn upgrade(&self) -> Option<Path> {
+        let conn = self.conn.upgrade_inner()?;
+        Some(Path::new_unchecked(conn, self.id))
     }
 }
 
