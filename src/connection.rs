@@ -175,6 +175,13 @@ fn push_waker_dedup(wakers: &mut VecDeque<Waker>, waker: &Waker) {
     wakers.push_back(waker.clone());
 }
 
+fn push_waker_if_not_last(wakers: &mut VecDeque<Waker>, waker: &Waker) {
+    match wakers.back() {
+        Some(existing) if existing.will_wake(waker) => {}
+        _ => wakers.push_back(waker.clone()),
+    }
+}
+
 fn broadcast<T: Clone>(listeners: &mut Vec<Sender<T>>, event: T) {
     listeners.retain(|tx| tx.send(event.clone()).is_ok());
 }
@@ -1316,7 +1323,7 @@ impl Connection {
             state.wake();
             Poll::Ready(Ok((stream, state.conn.is_handshaking())))
         } else {
-            state.stream_opened[dir as usize].push_back(cx.waker().clone());
+            push_waker_if_not_last(&mut state.stream_opened[dir as usize], cx.waker());
             Poll::Pending
         }
     }

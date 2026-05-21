@@ -1,4 +1,4 @@
-use comnoq::{ConnectionError, Endpoint, TransportConfig};
+use comnoq::{ConnectionError, Endpoint, OpenStreamError, TransportConfig};
 use synchrony::unsync::async_flag::AsyncFlag;
 
 mod common;
@@ -111,6 +111,43 @@ async fn stream_id_flow_control() {
             conn2.accept_uni().await.unwrap();
         }
     );
+
+    drop(conn1);
+    drop(conn2);
+
+    endpoint.shutdown().await.unwrap();
+}
+
+#[compio::test]
+async fn bidi_stream_id_flow_control() {
+    let _guard = subscribe();
+
+    let mut cfg = TransportConfig::default();
+    cfg.max_concurrent_bidi_streams(1u32.into());
+
+    let (server_config, client_config) = config_pair(Some(cfg));
+    let mut endpoint = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    let (conn1, conn2) = join!(
+        async {
+            endpoint
+                .connect(endpoint.local_addr().unwrap(), "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        async { endpoint.accept().await.unwrap().await.unwrap() },
+    );
+
+    let stream = conn1.try_open_bi().unwrap();
+    assert!(matches!(
+        conn1.try_open_bi(),
+        Err(OpenStreamError::StreamsExhausted)
+    ));
+    drop(stream);
 
     drop(conn1);
     drop(conn2);
