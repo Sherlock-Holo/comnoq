@@ -298,8 +298,11 @@ impl Stream for AddressDiscovery {
         }
 
         loop {
+            // PathEvent variants are #[non_exhaustive], use `..` in patterns
             match Pin::new(&mut self.events).poll_next(cx) {
-                Poll::Ready(Some(PathEvent::ObservedAddr { id, addr })) if id == self.path_id => {
+                Poll::Ready(Some(PathEvent::ObservedAddr { id, addr, .. }))
+                    if id == self.path_id =>
+                {
                     if self.last_value != Some(addr) {
                         self.last_value = Some(addr);
                         return Poll::Ready(Some(addr));

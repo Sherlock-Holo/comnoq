@@ -460,11 +460,12 @@ impl ConnectionInner {
                         wake_waiters(&mut state.on_handshake_confirmed);
                     }
                     Path(event) => {
+                        // PathEvent variants are #[non_exhaustive], use `..` in patterns
                         match &event {
                             PathEvent::ObservedAddr { addr, .. } => {
                                 state.observed_external_addr = Some(*addr);
                             }
-                            PathEvent::Opened { id } => {
+                            PathEvent::Established { id, .. } => {
                                 if let Some(tx) = state.open_path.remove(id) {
                                     let _ = tx.send(Ok(()));
                                 }
@@ -474,12 +475,14 @@ impl ConnectionInner {
                                     let _ = tx.send(Err(PathError::ValidationFailed));
                                 }
                             }
-                            PathEvent::Discarded { id, path_stats } => {
+                            PathEvent::Discarded { id, path_stats, .. } => {
                                 if state.path_refs.contains_key(id) {
                                     state.final_path_stats.insert(*id, **path_stats);
                                 }
                             }
                             PathEvent::RemoteStatus { .. } => {}
+                            // Future-proofing: PathEvent is #[non_exhaustive]
+                            _ => {}
                         }
                         broadcast(&mut state.path_events, event);
                     }

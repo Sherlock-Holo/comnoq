@@ -129,7 +129,7 @@ async fn handshake_confirmed_and_open_path_event() {
 
     loop {
         let event = path_events.recv_async().await.unwrap();
-        if matches!(event, PathEvent::Opened { id } if id == path.id()) {
+        if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
             break;
         }
     }
@@ -177,7 +177,7 @@ async fn discarded_path_stats_are_retained() {
 
     loop {
         let event = path_events.recv_async().await.unwrap();
-        if matches!(event, PathEvent::Opened { id } if id == path.id()) {
+        if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
             break;
         }
     }
@@ -255,7 +255,7 @@ async fn handshake_confirmed_and_open_path_event_dual_stack() {
 
     loop {
         let event = path_events.recv_async().await.unwrap();
-        if matches!(event, PathEvent::Opened { id } if id == path.id()) {
+        if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
             break;
         }
     }
