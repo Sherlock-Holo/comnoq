@@ -295,9 +295,11 @@ impl ConnectionInner {
     }
 
     pub(crate) fn path(inner: &Shared<Self>, id: PathId) -> Option<Path> {
-        inner.state.lock().conn.path_status(id).ok()?;
-
-        Some(Path::new_unchecked(inner.clone(), id))
+        let mut state = inner.state.lock();
+        state.conn.path_status(id).ok()?;
+        state.increment_path_refs(id);
+        drop(state);
+        Some(Path::new_unchecked_without_ref(inner.clone(), id))
     }
 
     pub(crate) fn paths(inner: &Shared<ConnectionInner>) -> Vec<Path> {
@@ -1052,9 +1054,13 @@ impl Connection {
         let worker = self.0.state().worker.take();
         if let Some(worker) = worker {
             let _ = worker.await;
+            return self.0.try_state().unwrap_err();
         }
 
-        self.0.try_state().unwrap_err()
+        // Worker handle was already taken (e.g. by another Connection clone).
+        // Fall back to on_closed to wait for termination without clashing with
+        // the event loop's poller waker.
+        self.on_closed().await.reason
     }
 
     /// If the connection is closed, the reason why.

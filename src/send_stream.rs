@@ -538,11 +538,9 @@ pub(crate) mod h3_impl {
             cx: &mut Context<'_>,
             buf: &mut D,
         ) -> Poll<Result<usize, StreamErrorIncoming>> {
-            // This signifies a bug in implementation
-            debug_assert!(
-                self.buf.is_some(),
-                "poll_send called while send stream is not ready"
-            );
+            if self.buf.is_none() {
+                return Poll::Ready(Err(WriteError::NotReady.into()));
+            }
 
             let n = ready!(
                 self.inner

@@ -82,11 +82,11 @@ impl EndpointState {
                     }
                 }
                 Some(DatagramEvent::ConnectionEvent(ch, event)) => {
-                    let _ = self
-                        .connections
-                        .get(&ch)
-                        .unwrap()
-                        .send(ConnectionEvent::Proto(event));
+                    if let Some(tx) = self.connections.get(&ch) {
+                        let _ = tx.send(ConnectionEvent::Proto(event));
+                    } else {
+                        compio_log::warn!("discarding event for unknown connection {ch:?}");
+                    }
                 }
                 Some(DatagramEvent::Response(transmit)) => respond_fn(resp_buf, transmit),
                 None => {}
@@ -98,12 +98,15 @@ impl EndpointState {
         if event.is_drained() {
             self.connections.remove(&ch);
         }
-        if let Some(event) = self.endpoint.handle_event(ch, event) {
-            let _ = self
-                .connections
-                .get(&ch)
-                .unwrap()
-                .send(ConnectionEvent::Proto(event));
+        let result = self.endpoint.handle_event(ch, event);
+        match (result, self.connections.get(&ch)) {
+            (Some(event), Some(tx)) => {
+                let _ = tx.send(ConnectionEvent::Proto(event));
+            }
+            (Some(_), None) => {
+                compio_log::warn!("discarding event for connection {ch:?}");
+            }
+            _ => {}
         }
     }
 

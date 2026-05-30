@@ -111,6 +111,10 @@ impl Path {
         Self { id, conn }
     }
 
+    pub(crate) fn new_unchecked_without_ref(conn: Shared<ConnectionInner>, id: PathId) -> Self {
+        Self { id, conn }
+    }
+
     /// Returns a weak handle for this path.
     pub fn weak_handle(&self) -> WeakPathHandle {
         self.conn.state().increment_path_refs(self.id);
