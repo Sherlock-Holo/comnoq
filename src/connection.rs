@@ -5,6 +5,7 @@ use std::sync::Weak as WeakShared;
 use std::{
     collections::VecDeque,
     fmt::Debug,
+    io,
     net::{IpAddr, SocketAddr, SocketAddrV6},
     pin::{Pin, pin},
     task::{Context, Poll, Waker},
@@ -12,6 +13,7 @@ use std::{
 };
 
 use compio::buf::bytes::Bytes;
+use compio::net::UdpSocket;
 use compio::runtime::JoinHandle;
 use compio_log::Instrument;
 use flume::{Receiver, Sender, unbounded};
@@ -31,7 +33,8 @@ use rustc_hash::FxHashMap as HashMap;
 use thiserror::Error;
 
 use crate::{
-    OpenPath, Path, RecvStream, SendStream, Socket,
+    OpenPath, Path, RecvStream, SendStream, Socket, SocketEntry, SocketSet, select_socket,
+    spawn_recv_task,
     sync::{
         mutex_blocking::{Mutex, MutexGuard},
         shared::Shared,
@@ -213,13 +216,20 @@ fn normalize_remote_address(
     })
 }
 
-#[derive(Debug)]
 pub(crate) struct ConnectionInner {
     state: Mutex<ConnectionState>,
     handle: ConnectionHandle,
-    socket: Socket,
+    pub(crate) sockets: SocketSet,
     events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
     events_rx: Receiver<ConnectionEvent>,
+}
+
+impl std::fmt::Debug for ConnectionInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionInner")
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
 }
 
 fn implicit_close(this: &Shared<ConnectionInner>) {
@@ -232,7 +242,7 @@ impl ConnectionInner {
     fn new(
         handle: ConnectionHandle,
         conn: noq_proto::Connection,
-        socket: Socket,
+        sockets: SocketSet,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
         events_rx: Receiver<ConnectionEvent>,
     ) -> Self {
@@ -263,7 +273,7 @@ impl ConnectionInner {
                 stopped: HashMap::default(),
             }),
             handle,
-            socket,
+            sockets,
             events_tx,
             events_rx,
         }
@@ -400,12 +410,19 @@ impl ConnectionInner {
             };
 
             if let Some(mut buf) = send_buf.take() {
-                if let Some(transmit) = state.conn.poll_transmit(
-                    Instant::now(),
-                    self.socket.max_gso_segments(),
-                    &mut buf,
-                ) {
-                    transmit_fut.set(async move { self.socket.send(buf, &transmit).await }.fuse())
+                let default_socket = select_socket(&self.sockets, None);
+                let default_max_gso = default_socket.max_gso_segments();
+                if let Some(transmit) =
+                    state
+                        .conn
+                        .poll_transmit(Instant::now(), default_max_gso, &mut buf)
+                {
+                    let socket = if transmit.src_ip.is_some() {
+                        select_socket(&self.sockets, transmit.src_ip)
+                    } else {
+                        default_socket
+                    };
+                    transmit_fut.set(async move { socket.send(buf, &transmit).await }.fuse())
                 } else {
                     send_buf = Some(buf);
                 }
@@ -710,12 +727,12 @@ impl Connecting {
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: noq_proto::Connection,
-        socket: Socket,
+        sockets: SocketSet,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
         events_rx: Receiver<ConnectionEvent>,
     ) -> Self {
         let inner = Shared::new(ConnectionInner::new(
-            handle, conn, socket, events_tx, events_rx,
+            handle, conn, sockets, events_tx, events_rx,
         ));
         let worker = compio::runtime::spawn({
             let inner = inner.clone();
@@ -1048,17 +1065,23 @@ impl Connection {
     }
 
     /// Opens an additional path if multipath is negotiated.
-    pub fn open_path(&self, addr: SocketAddr, initial_status: PathStatus) -> OpenPath {
+    pub fn open_path(
+        &self,
+        addr: SocketAddr,
+        local_ip: Option<IpAddr>,
+        initial_status: PathStatus,
+    ) -> OpenPath {
         let mut state = self.0.state();
         let addr = match normalize_remote_address(&state, addr) {
             Ok(addr) => addr,
             Err(err) => return OpenPath::rejected(err),
         };
         let (tx, rx) = flume::bounded(1);
-        let result =
-            state
-                .conn
-                .open_path(FourTuple::new(addr, None), initial_status, Instant::now());
+        let result = state.conn.open_path(
+            FourTuple::new(addr, local_ip),
+            initial_status,
+            Instant::now(),
+        );
         match result {
             Ok(path_id) => {
                 state.open_path.insert(path_id, tx);
@@ -1066,6 +1089,58 @@ impl Connection {
                 OpenPath::new(path_id, rx, self.0.clone())
             }
             Err(err) => OpenPath::rejected(err),
+        }
+    }
+
+    /// Opens an additional path using a new socket.
+    ///
+    /// The socket should already be bound to a local address (e.g., via
+    /// Android's `Network.bindSocket(fd)`). `local_ip` is derived from the
+    /// socket's bound address. The socket is registered with the endpoint
+    /// and a recv task is spawned automatically.
+    pub fn open_path_socket(
+        &self,
+        addr: SocketAddr,
+        socket: UdpSocket,
+        initial_status: PathStatus,
+    ) -> Result<OpenPath, io::Error> {
+        let mut state = self.0.state();
+        let addr = match normalize_remote_address(&state, addr) {
+            Ok(addr) => addr,
+            Err(err) => return Ok(OpenPath::rejected(err)),
+        };
+
+        let socket = Socket::new(socket)?;
+        let local_addr = socket.local_addr()?;
+        let local_ip = match local_addr.ip() {
+            IpAddr::V4(a) if a.is_unspecified() => None,
+            IpAddr::V6(a) if a.is_unspecified() => None,
+            ip => Some(ip),
+        };
+
+        let max_payload = self.0.sockets.lock().unwrap().max_payload_size;
+        {
+            let mut shared = self.0.sockets.lock().unwrap();
+            shared.sockets.push(SocketEntry {
+                socket: socket.clone(),
+                local_ip,
+            });
+        }
+        spawn_recv_task(&self.0.sockets, &socket, max_payload);
+
+        let (tx, rx) = flume::bounded(1);
+        let result = state.conn.open_path(
+            FourTuple::new(addr, local_ip),
+            initial_status,
+            Instant::now(),
+        );
+        match result {
+            Ok(path_id) => {
+                state.open_path.insert(path_id, tx);
+                state.wake();
+                Ok(OpenPath::new(path_id, rx, self.0.clone()))
+            }
+            Err(err) => Ok(OpenPath::rejected(err)),
         }
     }
 

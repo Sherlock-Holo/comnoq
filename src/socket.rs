@@ -14,11 +14,12 @@ use std::{
     mem::MaybeUninit,
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
-    sync::atomic::Ordering,
+    sync::{Arc, Mutex, atomic::Ordering},
 };
 
 use compio::buf::{BufResult, IntoInner, IoBuf, IoBufMut, SetLen, buf_try};
 use compio::net::{CMsgBuilder, CMsgIter, UdpSocket};
+use flume::Sender;
 use noq_proto::{EcnCodepoint, Transmit};
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock;
@@ -632,6 +633,72 @@ impl Clone for Socket {
             encode_src_ip_v4: self.encode_src_ip_v4,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SocketEntry {
+    pub socket: Socket,
+    pub local_ip: Option<IpAddr>,
+}
+
+pub(crate) type RecvItem = (RecvMeta, Vec<u8>);
+
+pub(crate) struct SharedSocketState {
+    pub sockets: Vec<SocketEntry>,
+    pub recv_tx: Sender<RecvItem>,
+    pub stopped: Arc<AtomicBool>,
+    pub max_payload_size: usize,
+}
+
+pub(crate) type SocketSet = Arc<Mutex<SharedSocketState>>;
+
+pub(crate) fn select_socket(sockets: &SocketSet, src_ip: Option<IpAddr>) -> Socket {
+    let state = sockets.lock().unwrap();
+    if let Some(ip) = src_ip
+        && let Some(entry) = state.sockets.iter().find(|e| e.local_ip == Some(ip))
+    {
+        return entry.socket.clone();
+    }
+    state
+        .sockets
+        .iter()
+        .find(|e| e.local_ip.is_none())
+        .unwrap_or(&state.sockets[0])
+        .socket
+        .clone()
+}
+
+pub(crate) fn spawn_recv_task(sockets: &SocketSet, socket: &Socket, max_payload: usize) {
+    let socket = socket.clone();
+    let recv_tx;
+    let stopped;
+    {
+        let shared = sockets.lock().unwrap();
+        recv_tx = shared.recv_tx.clone();
+        stopped = shared.stopped.clone();
+    }
+    let max_gro = socket.max_gro_segments();
+
+    compio::runtime::spawn(async move {
+        loop {
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            let buf = Vec::with_capacity(max_payload * max_gro);
+            let BufResult(res, buf) = socket.recv(buf).await;
+            match res {
+                Ok(meta) => {
+                    recv_tx.send_async((meta, buf)).await.ok();
+                }
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                Err(_e) => {
+                    compio_log::error!("socket recv error: {_e:?}");
+                    break;
+                }
+            }
+        }
+    })
+    .detach();
 }
 
 #[cfg(test)]

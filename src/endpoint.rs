@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    fmt::Debug,
     future::poll_fn,
     io,
     mem::ManuallyDrop,
@@ -8,7 +7,7 @@ use std::{
     ops::Deref,
     pin::{Pin, pin},
     ptr,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     task::{Context, Poll, Waker},
     time::Instant,
 };
@@ -28,8 +27,9 @@ use noq_proto::{
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
-    Connecting, ConnectionEvent, Incoming, RecvMeta, Socket,
-    sync::{mutex_blocking::Mutex, shared::Shared},
+    Connecting, ConnectionEvent, Incoming, RecvMeta, SharedSocketState, Socket, SocketEntry,
+    SocketSet, select_socket, spawn_recv_task,
+    sync::{atomic::AtomicBool, mutex_blocking::Mutex, shared::Shared},
 };
 
 #[derive(Debug)]
@@ -128,7 +128,7 @@ impl EndpointState {
         &mut self,
         handle: ConnectionHandle,
         conn: noq_proto::Connection,
-        socket: Socket,
+        sockets: SocketSet,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
     ) -> Connecting {
         let (tx, rx) = unbounded();
@@ -137,7 +137,7 @@ impl EndpointState {
                 .unwrap();
         }
         self.connections.insert(handle, tx);
-        Connecting::new(handle, conn, socket, events_tx, rx)
+        Connecting::new(handle, conn, sockets, events_tx, rx)
     }
 }
 
@@ -151,13 +151,21 @@ impl Drop for EndpointState {
 
 type ChannelPair<T> = (Sender<T>, Receiver<T>);
 
-#[derive(Debug)]
 pub(crate) struct EndpointInner {
     state: Mutex<EndpointState>,
-    socket: Socket,
+    sockets: SocketSet,
+    recv_rx: Receiver<crate::RecvItem>,
     ipv6: bool,
     events: ChannelPair<(ConnectionHandle, EndpointEvent)>,
     done: AtomicWaker,
+}
+
+impl std::fmt::Debug for EndpointInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointInner")
+            .field("ipv6", &self.ipv6)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EndpointInner {
@@ -170,10 +178,14 @@ impl EndpointInner {
         let ipv6 = socket.local_addr()?.is_ipv6();
         let allow_mtud = !socket.may_fragment();
 
+        let (recv_tx, recv_rx) = flume::unbounded();
+        let endpoint_config = Arc::new(config);
+        let max_payload_size = endpoint_config.get_max_udp_payload_size().min(64 * 1024) as usize;
+
         Ok(Self {
             state: Mutex::new(EndpointState {
                 endpoint: noq_proto::Endpoint::new(
-                    Arc::new(config),
+                    endpoint_config,
                     server_config.map(Arc::new),
                     allow_mtud,
                 ),
@@ -185,7 +197,17 @@ impl EndpointInner {
                 incoming_wakers: VecDeque::new(),
                 stats: EndpointStats::default(),
             }),
-            socket,
+            #[allow(clippy::arc_with_non_send_sync)]
+            sockets: Arc::new(std::sync::Mutex::new(SharedSocketState {
+                sockets: vec![SocketEntry {
+                    socket,
+                    local_ip: None,
+                }],
+                recv_tx,
+                stopped: Arc::new(AtomicBool::new(false)),
+                max_payload_size,
+            })),
+            recv_rx,
             ipv6,
             events: unbounded(),
             done: AtomicWaker::new(),
@@ -222,11 +244,11 @@ impl EndpointInner {
             .connect(Instant::now(), config, remote, server_name)?;
         state.stats.outgoing_handshakes += 1;
 
-        Ok(state.new_connection(handle, conn, self.socket.clone(), self.events.0.clone()))
+        Ok(state.new_connection(handle, conn, self.sockets.clone(), self.events.0.clone()))
     }
 
     fn respond(&self, buf: Vec<u8>, transmit: Transmit) {
-        let socket = self.socket.clone();
+        let socket = select_socket(&self.sockets, transmit.src_ip);
         compio::runtime::spawn(async move {
             socket.send(buf, &transmit).await;
         })
@@ -247,7 +269,7 @@ impl EndpointInner {
         {
             Ok((handle, conn)) => {
                 state.stats.accepted_handshakes += 1;
-                Ok(state.new_connection(handle, conn, self.socket.clone(), self.events.0.clone()))
+                Ok(state.new_connection(handle, conn, self.sockets.clone(), self.events.0.clone()))
             }
             Err(err) => {
                 if let Some(transmit) = err.response {
@@ -284,20 +306,30 @@ impl EndpointInner {
     async fn run(&self) -> io::Result<()> {
         let respond_fn = |buf: Vec<u8>, transmit: Transmit| self.respond(buf, transmit);
 
+        let max_payload = self
+            .state
+            .lock()
+            .endpoint
+            .config()
+            .get_max_udp_payload_size()
+            .min(64 * 1024) as usize;
+
+        let primary_socket = {
+            let sockets = self.sockets.lock().unwrap();
+            for entry in sockets.sockets.iter().skip(1) {
+                spawn_recv_task(&self.sockets, &entry.socket, max_payload);
+            }
+            sockets.sockets[0].socket.clone()
+        };
+
         let mut recv_fut = pin!(
-            self.socket
+            primary_socket
                 .recv(Vec::with_capacity(
-                    self.state
-                        .lock()
-                        .endpoint
-                        .config()
-                        .get_max_udp_payload_size()
-                        .min(64 * 1024) as usize
-                        * self.socket.max_gro_segments(),
+                    max_payload * primary_socket.max_gro_segments()
                 ))
                 .fuse()
         );
-
+        let mut recv_stream = self.recv_rx.stream().ready_chunks(100);
         let mut event_stream = self.events.1.stream().ready_chunks(100);
 
         loop {
@@ -311,7 +343,14 @@ impl EndpointInner {
                         Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PORT_UNREACHABLE as _) => {}
                         Err(e) => break Err(e),
                     }
-                    recv_fut.set(self.socket.recv(recv_buf).fuse());
+                    recv_fut.set(primary_socket.recv(recv_buf).fuse());
+                    state
+                },
+                items = recv_stream.select_next_some() => {
+                    let mut state = self.state.lock();
+                    for (meta, buf) in items {
+                        state.handle_data(meta, &buf, respond_fn);
+                    }
                     state
                 },
                 events = event_stream.select_next_some() => {
@@ -348,6 +387,13 @@ impl EndpointRef {
     }
 
     async fn shutdown(self) -> io::Result<()> {
+        self.0
+            .sockets
+            .lock()
+            .unwrap()
+            .stopped
+            .store(true, Ordering::Relaxed);
+
         let (worker, idle) = {
             let mut state = self.0.state.lock();
             let idle = state.is_idle();
@@ -383,7 +429,19 @@ impl EndpointRef {
         })
         .await;
 
-        inner.socket.close().await
+        let sockets = inner
+            .sockets
+            .lock()
+            .unwrap()
+            .sockets
+            .drain(..)
+            .collect::<Vec<_>>();
+        for entry in sockets {
+            if let Err(_e) = entry.socket.close().await {
+                error!("failed to close socket: {_e}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -534,7 +592,9 @@ impl Endpoint {
 
     /// Get the local `SocketAddr` the underlying socket is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.socket.local_addr()
+        self.inner.sockets.lock().unwrap().sockets[0]
+            .socket
+            .local_addr()
     }
 
     /// Get the number of connections that are currently open.

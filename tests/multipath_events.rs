@@ -91,6 +91,113 @@ async fn path_api() {
 }
 
 #[compio::test]
+async fn open_path_with_local_ip() {
+    let _guard = subscribe();
+
+    let mut transport = TransportConfig::default();
+    transport.max_concurrent_multipath_paths(2);
+    let (client_endpoint, server_endpoint) = endpoint_pair_with_transport(transport).await;
+    let server_addr = server_endpoint.local_addr().unwrap();
+
+    let (client, server) = join!(
+        async {
+            client_endpoint
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        async { server_endpoint.accept().await.unwrap().await.unwrap() },
+    );
+
+    client.handshake_confirmed().await.unwrap();
+    assert!(client.is_multipath_enabled());
+
+    let local_ip = client_endpoint.local_addr().unwrap().ip();
+    let path_events = client.path_events();
+    let path = loop {
+        match client
+            .open_path(server_addr, Some(local_ip), PathStatus::Available)
+            .await
+        {
+            Ok(path) => break path,
+            Err(PathError::RemoteCidsExhausted) => {
+                compio::runtime::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => panic!("unexpected open_path error: {err:?}"),
+        }
+    };
+
+    assert_ne!(path.id(), PathId::ZERO);
+    assert_eq!(path.local_ip().unwrap(), Some(local_ip));
+
+    loop {
+        let event = path_events.recv_async().await.unwrap();
+        if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
+            break;
+        }
+    }
+
+    drop(path);
+    drop(server);
+    drop(client);
+    client_endpoint.shutdown().await.unwrap();
+    server_endpoint.shutdown().await.unwrap();
+}
+
+#[compio::test]
+async fn open_path_with_new_socket() {
+    let _guard = subscribe();
+
+    let mut transport = TransportConfig::default();
+    transport.max_concurrent_multipath_paths(2);
+    let (client_endpoint, server_endpoint) = endpoint_pair_with_transport(transport).await;
+    let server_addr = server_endpoint.local_addr().unwrap();
+
+    let (client, server) = join!(
+        async {
+            client_endpoint
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        async { server_endpoint.accept().await.unwrap().await.unwrap() },
+    );
+
+    client.handshake_confirmed().await.unwrap();
+    assert!(client.is_multipath_enabled());
+
+    let new_socket = compio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let new_local_addr = new_socket.local_addr().unwrap();
+
+    let path_events = client.path_events();
+    let open_path = client
+        .open_path_socket(server_addr, new_socket, PathStatus::Available)
+        .unwrap();
+    let path = match open_path.await {
+        Ok(path) => path,
+        Err(err) => panic!("unexpected open_path error: {err:?}"),
+    };
+
+    assert_ne!(path.id(), PathId::ZERO);
+    assert_eq!(path.local_ip().unwrap(), Some(new_local_addr.ip()));
+
+    loop {
+        let event = path_events.recv_async().await.unwrap();
+        if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
+            break;
+        }
+    }
+
+    drop(path);
+    drop(server);
+    drop(client);
+    client_endpoint.shutdown().await.unwrap();
+    server_endpoint.shutdown().await.unwrap();
+}
+
+#[compio::test]
 async fn handshake_confirmed_and_open_path_event() {
     let _guard = subscribe();
 
@@ -115,7 +222,10 @@ async fn handshake_confirmed_and_open_path_event() {
 
     let path_events = client.path_events();
     let path = loop {
-        match client.open_path(server_addr, PathStatus::Available).await {
+        match client
+            .open_path(server_addr, None, PathStatus::Available)
+            .await
+        {
             Ok(path) => break path,
             Err(PathError::RemoteCidsExhausted) => {
                 compio::runtime::time::sleep(Duration::from_millis(10)).await;
@@ -166,7 +276,10 @@ async fn discarded_path_stats_are_retained() {
 
     let path_events = client.path_events();
     let path = loop {
-        match client.open_path(server_addr, PathStatus::Available).await {
+        match client
+            .open_path(server_addr, None, PathStatus::Available)
+            .await
+        {
             Ok(path) => break path,
             Err(PathError::RemoteCidsExhausted) => {
                 compio::runtime::time::sleep(Duration::from_millis(10)).await;
@@ -239,7 +352,7 @@ async fn handshake_confirmed_and_open_path_event_dual_stack() {
     ipv6_server_addr.set_ip("::1".parse().unwrap());
     let path = loop {
         match client
-            .open_path(ipv6_server_addr, PathStatus::Available)
+            .open_path(ipv6_server_addr, None, PathStatus::Available)
             .await
         {
             Ok(path) => break path,
