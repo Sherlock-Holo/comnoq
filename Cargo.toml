@@ -28,6 +28,8 @@ futures-util = "0.3.32"
 thiserror = "2.0.18"
 rustc-hash = "2.1.2"
 synchrony = { version = "0.1.8", features = ["async_flag"] }
+async-broadcast = "0.7.2"
+event-listener = "5.4.1"
 
 [dependencies.compio]
 version = "0.19.0"

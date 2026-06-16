@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     future::poll_fn,
-    io,
+    io, mem,
     mem::ManuallyDrop,
     net::{SocketAddr, SocketAddrV6},
     ops::Deref,
@@ -19,17 +19,18 @@ use compio::net::UdpSocket;
 use compio::runtime::JoinHandle;
 use compio_log::{Instrument, error};
 use flume::{Receiver, Sender, unbounded};
-use futures_util::{FutureExt, StreamExt, select, task::AtomicWaker};
+use futures_util::{FutureExt, StreamExt, future::FusedFuture, select, task::AtomicWaker};
 use noq_proto::{
     ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointConfig,
-    EndpointEvent, FourTuple, ServerConfig, Transmit, VarInt,
+    EndpointEvent, FourTuple, NetworkChangeHint, ServerConfig, Transmit, VarInt,
 };
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
-    Connecting, ConnectionEvent, Incoming, RecvMeta, SharedSocketState, Socket, SocketEntry,
-    SocketSet, select_socket, spawn_recv_task,
+    Connecting, ConnectionEvent, IO_LOOP_BOUND, Incoming, RECV_TIME_BOUND, RecvMeta,
+    SharedSocketState, Socket, SocketEntry, SocketSet, select_socket, spawn_recv_task,
     sync::{atomic::AtomicBool, mutex_blocking::Mutex, shared::Shared},
+    work_limiter::WorkLimiter,
 };
 
 #[derive(Debug)]
@@ -39,8 +40,10 @@ struct EndpointState {
     connections: HashMap<ConnectionHandle, Sender<ConnectionEvent>>,
     close: Option<(VarInt, Bytes)>,
     exit_on_idle: bool,
+    active_connections: usize,
     incoming: VecDeque<noq_proto::Incoming>,
     incoming_wakers: VecDeque<Waker>,
+    all_draining_wakers: VecDeque<Waker>,
     stats: EndpointStats,
 }
 
@@ -59,12 +62,19 @@ pub struct EndpointStats {
 }
 
 impl EndpointState {
-    fn handle_data(&mut self, meta: RecvMeta, buf: &[u8], respond_fn: impl Fn(Vec<u8>, Transmit)) {
+    fn handle_data(
+        &mut self,
+        meta: RecvMeta,
+        buf: &[u8],
+        respond_fn: impl Fn(Vec<u8>, Transmit),
+    ) -> usize {
         let now = Instant::now();
+        let mut processed = 0;
         for data in buf[..meta.len]
             .chunks(meta.stride.min(meta.len))
             .map(Into::into)
         {
+            processed += 1;
             let mut resp_buf = Vec::new();
             match self.endpoint.handle(
                 now,
@@ -92,9 +102,16 @@ impl EndpointState {
                 None => {}
             }
         }
+        processed
     }
 
     fn handle_event(&mut self, ch: ConnectionHandle, event: EndpointEvent) {
+        if event.is_draining() {
+            self.active_connections = self.active_connections.saturating_sub(1);
+            if self.all_draining() {
+                self.all_draining_wakers.drain(..).for_each(Waker::wake);
+            }
+        }
         if event.is_drained() {
             self.connections.remove(&ch);
         }
@@ -112,6 +129,10 @@ impl EndpointState {
 
     fn is_idle(&self) -> bool {
         self.connections.is_empty()
+    }
+
+    fn all_draining(&self) -> bool {
+        self.active_connections == 0
     }
 
     fn poll_incoming(&mut self, cx: &mut Context) -> Poll<Option<noq_proto::Incoming>> {
@@ -139,6 +160,7 @@ impl EndpointState {
             tx.send(ConnectionEvent::Close(*error_code, reason.clone()))
                 .unwrap();
         }
+        self.active_connections += 1;
         self.connections.insert(handle, tx);
         Connecting::new(handle, conn, sockets, events_tx, rx)
     }
@@ -158,15 +180,16 @@ pub(crate) struct EndpointInner {
     state: Mutex<EndpointState>,
     sockets: SocketSet,
     recv_rx: Receiver<crate::RecvItem>,
-    ipv6: bool,
+    ipv6: AtomicBool,
     events: ChannelPair<(ConnectionHandle, EndpointEvent)>,
+    rebind: ChannelPair<Socket>,
     done: AtomicWaker,
 }
 
 impl std::fmt::Debug for EndpointInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EndpointInner")
-            .field("ipv6", &self.ipv6)
+            .field("ipv6", &self.ipv6.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -181,7 +204,7 @@ impl EndpointInner {
         let ipv6 = socket.local_addr()?.is_ipv6();
         let allow_mtud = !socket.may_fragment();
 
-        let (recv_tx, recv_rx) = flume::unbounded();
+        let (recv_tx, recv_rx) = unbounded();
         let endpoint_config = Arc::new(config);
         let max_payload_size = endpoint_config.get_max_udp_payload_size().min(64 * 1024) as usize;
 
@@ -196,8 +219,10 @@ impl EndpointInner {
                 connections: HashMap::default(),
                 close: None,
                 exit_on_idle: false,
+                active_connections: 0,
                 incoming: VecDeque::new(),
                 incoming_wakers: VecDeque::new(),
+                all_draining_wakers: VecDeque::new(),
                 stats: EndpointStats::default(),
             }),
             #[allow(clippy::arc_with_non_send_sync)]
@@ -206,13 +231,15 @@ impl EndpointInner {
                     socket,
                     local_ip: None,
                 }],
+                prev_sockets: Vec::new(),
                 recv_tx,
                 stopped: Arc::new(AtomicBool::new(false)),
                 max_payload_size,
             })),
             recv_rx,
-            ipv6,
+            ipv6: AtomicBool::new(ipv6),
             events: unbounded(),
+            rebind: unbounded(),
             done: AtomicWaker::new(),
         })
     }
@@ -228,10 +255,11 @@ impl EndpointInner {
         if state.worker.is_none() {
             return Err(ConnectError::EndpointStopping);
         }
-        if remote.is_ipv6() && !self.ipv6 {
+        let ipv6 = self.ipv6.load(Ordering::Relaxed);
+        if remote.is_ipv6() && !ipv6 {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
-        let remote = if self.ipv6 {
+        let remote = if ipv6 {
             SocketAddr::V6(match remote {
                 SocketAddr::V4(addr) => {
                     SocketAddrV6::new(addr.ip().to_ipv6_mapped(), addr.port(), 0, 0)
@@ -306,6 +334,17 @@ impl EndpointInner {
         state.endpoint.ignore(incoming);
     }
 
+    fn recv_on(
+        socket: Socket,
+        buffer: Vec<u8>,
+    ) -> impl FusedFuture<Output = (Socket, BufResult<RecvMeta, Vec<u8>>)> {
+        async move {
+            let result = socket.recv(buffer).await;
+            (socket, result)
+        }
+        .fuse()
+    }
+
     async fn run(&self) -> io::Result<()> {
         let respond_fn = |buf: Vec<u8>, transmit: Transmit| self.respond(buf, transmit);
 
@@ -325,40 +364,48 @@ impl EndpointInner {
             sockets.sockets[0].socket.clone()
         };
 
-        let mut recv_fut = pin!(
-            primary_socket
-                .recv(Vec::with_capacity(
-                    max_payload * primary_socket.max_gro_segments()
-                ))
-                .fuse()
-        );
-        let mut recv_stream = self.recv_rx.stream().ready_chunks(100);
-        let mut event_stream = self.events.1.stream().ready_chunks(100);
+        let recv_buf = Vec::with_capacity(max_payload * primary_socket.max_gro_segments());
+        let mut recv_fut = pin!(Self::recv_on(primary_socket, recv_buf));
+        let mut recv_stream = self.recv_rx.stream().ready_chunks(IO_LOOP_BOUND);
+        let mut event_stream = self.events.1.stream().ready_chunks(IO_LOOP_BOUND);
+        let mut rebind_stream = self.rebind.1.stream();
+        let mut recv_limiter = WorkLimiter::new(RECV_TIME_BOUND);
 
         loop {
             let mut state = select! {
-                BufResult(res, recv_buf) = recv_fut => {
+                (socket, BufResult(res, recv_buf)) = recv_fut => {
                     let mut state = self.state.lock();
                     match res {
-                        Ok(meta) => state.handle_data(meta, &recv_buf, respond_fn),
+                        Ok(meta) => {
+                            state.handle_data(meta, &recv_buf, respond_fn);
+                        }
                         Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
                         #[cfg(windows)]
                         Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PORT_UNREACHABLE as _) => {}
                         Err(e) => break Err(e),
                     }
-                    recv_fut.set(primary_socket.recv(recv_buf).fuse());
+                    recv_fut.set(Self::recv_on(socket, recv_buf));
                     state
+                },
+                socket = rebind_stream.select_next_some() => {
+                    let recv_buf = Vec::with_capacity(max_payload * socket.max_gro_segments());
+                    recv_fut.set(Self::recv_on(socket, recv_buf));
+                    self.state.lock()
                 },
                 items = recv_stream.select_next_some() => {
                     let mut state = self.state.lock();
+                    recv_limiter.start_cycle(Instant::now);
                     for (meta, buf) in items {
-                        state.handle_data(meta, &buf, respond_fn);
+                        let _ = recv_limiter.allow_work(Instant::now);
+                        let processed = state.handle_data(meta, &buf, respond_fn);
+                        recv_limiter.record_work(processed);
                     }
+                    recv_limiter.finish_cycle(Instant::now);
                     state
                 },
                 events = event_stream.select_next_some() => {
                     let mut state = self.state.lock();
-                    for (ch, event) in events {
+                    for (ch, event) in events.into_iter().take(IO_LOOP_BOUND) {
                         state.handle_event(ch, event);
                     }
                     state
@@ -432,16 +479,21 @@ impl EndpointRef {
         })
         .await;
 
-        let sockets = inner
-            .sockets
-            .lock()
-            .unwrap()
-            .sockets
-            .drain(..)
-            .collect::<Vec<_>>();
+        let (sockets, prev_sockets) = {
+            let mut sockets = inner.sockets.lock().unwrap();
+            (
+                sockets.sockets.drain(..).collect::<Vec<_>>(),
+                sockets.prev_sockets.drain(..).collect::<Vec<_>>(),
+            )
+        };
         for entry in sockets {
             if let Err(_e) = entry.socket.close().await {
                 error!("failed to close socket: {_e}");
+            }
+        }
+        for socket in prev_sockets {
+            if let Err(_e) = socket.close().await {
+                error!("failed to close previous socket: {_e}");
             }
         }
         Ok(())
@@ -580,6 +632,40 @@ impl Endpoint {
         self.inner.connect(remote, server_name, config)
     }
 
+    /// Switch to a new UDP socket.
+    ///
+    /// This updates the endpoint's primary socket and notifies active connections that the local
+    /// network path changed. Additional sockets opened through [`crate::Connection::open_path_socket`]
+    /// are preserved.
+    pub fn rebind(&self, socket: UdpSocket) -> io::Result<()> {
+        let socket = Socket::new(socket)?;
+        let addr = socket.local_addr()?;
+        let old_socket = {
+            let mut sockets = self.inner.sockets.lock().unwrap();
+            let old = mem::replace(&mut sockets.sockets[0].socket, socket.clone());
+            sockets.sockets[0].local_ip = None;
+            sockets.prev_sockets.push(old.clone());
+            old
+        };
+        self.inner.ipv6.store(addr.is_ipv6(), Ordering::Relaxed);
+        drop(old_socket);
+        let _ = self.inner.rebind.0.send(socket);
+
+        let state = self.inner.state.lock();
+        for conn in state.connections.values() {
+            let _ = conn.send(ConnectionEvent::Rebind);
+        }
+        Ok(())
+    }
+
+    /// Notify connections that the local network address has changed.
+    pub fn handle_network_change(&self, hint: Option<Arc<dyn NetworkChangeHint + Send + Sync>>) {
+        let state = self.inner.state.lock();
+        for conn in state.connections.values() {
+            let _ = conn.send(ConnectionEvent::LocalAddressChanged(hint.clone()));
+        }
+    }
+
     /// Replace the server configuration, affecting new incoming connections
     /// only.
     ///
@@ -612,16 +698,34 @@ impl Endpoint {
     ///
     /// [`Connection::close()`]: crate::Connection::close
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
-        let reason = Bytes::copy_from_slice(reason);
         let mut state = self.inner.state.lock();
         if state.close.is_some() {
             return;
         }
+
+        let reason = Bytes::copy_from_slice(reason);
         state.close = Some((error_code, reason.clone()));
         for conn in state.connections.values() {
             let _ = conn.send(ConnectionEvent::Close(error_code, reason.clone()));
         }
         state.incoming_wakers.drain(..).for_each(Waker::wake);
+        if state.all_draining() {
+            state.all_draining_wakers.drain(..).for_each(Waker::wake);
+        }
+    }
+
+    /// Wait for all connections on the endpoint to enter draining or be drained.
+    pub async fn wait_all_draining(&self) {
+        poll_fn(|cx| {
+            let mut state = self.inner.state.lock();
+            if state.all_draining() {
+                Poll::Ready(())
+            } else {
+                state.all_draining_wakers.push_back(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
     }
 
     /// Wait for all connections on the endpoint to be cleanly shut down.

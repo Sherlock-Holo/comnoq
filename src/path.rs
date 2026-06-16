@@ -6,14 +6,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flume::{Receiver, r#async::RecvStream};
-use futures_util::Stream;
+use futures_util::{Stream, ready};
 use noq_proto::{
     ClosePathError, ClosedPath, PathError, PathEvent, PathId, PathStats, PathStatus,
     SetPathStatusError, TransportErrorCode,
 };
 
-use crate::{ConnectionInner, WeakConnectionHandle, sync::shared::Shared};
+use crate::{
+    ConnectionInner, PathEvents, WeakConnectionHandle,
+    event_stream::{BroadcastReceiver, Lagged},
+    sync::shared::Shared,
+};
 
 /// Future produced by [`crate::Connection::open_path`].
 #[derive(Debug)]
@@ -22,19 +25,25 @@ pub struct OpenPath(OpenPathInner);
 #[derive(Debug)]
 enum OpenPathInner {
     Ongoing {
-        opened: Receiver<Result<(), PathError>>,
+        opened: BroadcastReceiver<Result<(), PathError>>,
         path_id: PathId,
         conn: Shared<ConnectionInner>,
     },
+
     Rejected {
         err: PathError,
+    },
+
+    Ready {
+        path_id: PathId,
+        conn: Shared<ConnectionInner>,
     },
 }
 
 impl OpenPath {
     pub(crate) fn new(
         path_id: PathId,
-        opened: Receiver<Result<(), PathError>>,
+        opened: BroadcastReceiver<Result<(), PathError>>,
         conn: Shared<ConnectionInner>,
     ) -> Self {
         Self(OpenPathInner::Ongoing {
@@ -48,11 +57,16 @@ impl OpenPath {
         Self(OpenPathInner::Rejected { err })
     }
 
+    pub(crate) fn ready(path_id: PathId, conn: Shared<ConnectionInner>) -> Self {
+        Self(OpenPathInner::Ready { path_id, conn })
+    }
+
     /// Returns the path ID allocated for this path opening attempt.
     pub fn path_id(&self) -> Option<PathId> {
         match self.0 {
             OpenPathInner::Ongoing { path_id, .. } => Some(path_id),
             OpenPathInner::Rejected { .. } => None,
+            OpenPathInner::Ready { path_id, .. } => Some(path_id),
         }
     }
 }
@@ -66,18 +80,17 @@ impl Future for OpenPath {
                 opened,
                 path_id,
                 conn,
-            } => {
-                let mut recv = std::pin::pin!(opened.recv_async());
-                match recv.as_mut().poll(cx) {
-                    Poll::Ready(Ok(Ok(()))) => {
-                        Poll::Ready(Ok(Path::new_unchecked(conn.clone(), *path_id)))
-                    }
-                    Poll::Ready(Ok(Err(err))) => Poll::Ready(Err(err)),
-                    Poll::Ready(Err(_)) => Poll::Ready(Err(PathError::ValidationFailed)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
+            } => match ready!(opened.poll_event(cx)) {
+                Some(Ok(Ok(()))) => Poll::Ready(Ok(Path::new_unchecked(conn.clone(), *path_id))),
+                Some(Ok(Err(err))) => Poll::Ready(Err(err)),
+                Some(Err(_)) | None => Poll::Ready(Err(PathError::ValidationFailed)),
+            },
+
             OpenPathInner::Rejected { err } => Poll::Ready(Err(*err)),
+
+            OpenPathInner::Ready { path_id, conn } => {
+                Poll::Ready(Ok(Path::new_unchecked(conn.clone(), *path_id)))
+            }
         }
     }
 }
@@ -275,20 +288,16 @@ pub struct AddressDiscovery {
     path_id: PathId,
     initial_value: Option<SocketAddr>,
     last_value: Option<SocketAddr>,
-    events: RecvStream<'static, PathEvent>,
+    events: PathEvents,
 }
 
 impl AddressDiscovery {
-    fn new(
-        path_id: PathId,
-        path_events: Receiver<PathEvent>,
-        initial_value: Option<SocketAddr>,
-    ) -> Self {
+    fn new(path_id: PathId, path_events: PathEvents, initial_value: Option<SocketAddr>) -> Self {
         Self {
             path_id,
             initial_value,
             last_value: initial_value,
-            events: path_events.into_stream(),
+            events: path_events,
         }
     }
 }
@@ -304,7 +313,7 @@ impl Stream for AddressDiscovery {
         loop {
             // PathEvent variants are #[non_exhaustive], use `..` in patterns
             match Pin::new(&mut self.events).poll_next(cx) {
-                Poll::Ready(Some(PathEvent::ObservedAddr { id, addr, .. }))
+                Poll::Ready(Some(Ok(PathEvent::ObservedAddr { id, addr, .. })))
                     if id == self.path_id =>
                 {
                     if self.last_value != Some(addr) {
@@ -312,10 +321,11 @@ impl Stream for AddressDiscovery {
                         return Poll::Ready(Some(addr));
                     }
                 }
-                Poll::Ready(Some(PathEvent::Discarded { id, .. })) if id == self.path_id => {
+                Poll::Ready(Some(Ok(PathEvent::Discarded { id, .. }))) if id == self.path_id => {
                     return Poll::Ready(None);
                 }
-                Poll::Ready(Some(_)) => {}
+                Poll::Ready(Some(Ok(_))) => {}
+                Poll::Ready(Some(Err(Lagged(_)))) => {}
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }

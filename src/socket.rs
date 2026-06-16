@@ -600,7 +600,7 @@ impl Socket {
         let mut control = self
             .construct_control_message(transmit)
             .expect("CMSG_LEN should be large enough");
-        let mut buffer = buffer.slice(0..transmit.size);
+        let mut buffer = buffer.slice(..transmit.size);
 
         loop {
             let res;
@@ -661,6 +661,7 @@ pub(crate) type RecvItem = (RecvMeta, Vec<u8>);
 
 pub(crate) struct SharedSocketState {
     pub sockets: Vec<SocketEntry>,
+    pub prev_sockets: Vec<Socket>,
     pub recv_tx: Sender<RecvItem>,
     pub stopped: Arc<AtomicBool>,
     pub max_payload_size: usize,
@@ -669,17 +670,17 @@ pub(crate) struct SharedSocketState {
 pub(crate) type SocketSet = Arc<Mutex<SharedSocketState>>;
 
 pub(crate) fn select_socket(sockets: &SocketSet, src_ip: Option<IpAddr>) -> Socket {
-    let state = sockets.lock().unwrap();
+    let sockets = sockets.lock().unwrap();
     if let Some(ip) = src_ip
-        && let Some(entry) = state.sockets.iter().find(|e| e.local_ip == Some(ip))
+        && let Some(entry) = sockets.sockets.iter().find(|e| e.local_ip == Some(ip))
     {
         return entry.socket.clone();
     }
-    state
+    sockets
         .sockets
         .iter()
         .find(|e| e.local_ip.is_none())
-        .unwrap_or(&state.sockets[0])
+        .unwrap_or(&sockets.sockets[0])
         .socket
         .clone()
 }
@@ -700,6 +701,7 @@ pub(crate) fn spawn_recv_task(sockets: &SocketSet, socket: &Socket, max_payload:
             if stopped.load(Ordering::Relaxed) {
                 break;
             }
+            // TODO: performance: consider buffer pool to reused buf
             let buf = Vec::with_capacity(max_payload * max_gro);
             let BufResult(res, buf) = socket.recv(buf).await;
             match res {

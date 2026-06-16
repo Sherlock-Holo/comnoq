@@ -8,6 +8,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr, SocketAddrV6},
     pin::{Pin, pin},
+    sync::Arc,
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
@@ -16,7 +17,7 @@ use compio::buf::bytes::Bytes;
 use compio::net::UdpSocket;
 use compio::runtime::JoinHandle;
 use compio_log::Instrument;
-use flume::{Receiver, Sender, unbounded};
+use flume::{Receiver, Sender};
 use futures_util::{
     FutureExt, StreamExt,
     future::{self, Fuse, FusedFuture, LocalBoxFuture},
@@ -25,16 +26,18 @@ use futures_util::{
 #[cfg(rustls)]
 use noq_proto::crypto::rustls::HandshakeData;
 use noq_proto::{
-    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, FourTuple, PathError, PathEvent, PathId,
-    PathStats, PathStatus, Side, StreamEvent, StreamId, VarInt, congestion::Controller,
-    n0_nat_traversal,
+    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, FourTuple, NetworkChangeHint, PathError,
+    PathEvent, PathId, PathStats, PathStatus, Side, StreamEvent, StreamId, VarInt,
+    congestion::Controller, n0_nat_traversal,
 };
 use rustc_hash::FxHashMap as HashMap;
 use thiserror::Error;
 
 use crate::{
-    OpenPath, Path, RecvStream, SendStream, Socket, SocketEntry, SocketSet, select_socket,
-    spawn_recv_task,
+    NatTraversalUpdates, ObservedExternalAddr, OpenPath, Path, PathEvents, RecvStream, SendStream,
+    Socket, SocketEntry, SocketSet,
+    event_stream::{Broadcast, Watch},
+    select_socket, spawn_recv_task,
     sync::{
         mutex_blocking::{Mutex, MutexGuard},
         shared::Shared,
@@ -45,6 +48,8 @@ use crate::{
 pub(crate) enum ConnectionEvent {
     Close(VarInt, Bytes),
     Proto(noq_proto::ConnectionEvent),
+    Rebind,
+    LocalAddressChanged(Option<Arc<dyn NetworkChangeHint + Send + Sync>>),
 }
 
 #[derive(Debug)]
@@ -62,10 +67,11 @@ pub(crate) struct ConnectionState {
     datagrams_unblocked: VecDeque<Waker>,
     stream_opened: [VecDeque<Waker>; 2],
     stream_available: [VecDeque<Waker>; 2],
-    open_path: HashMap<PathId, Sender<Result<(), PathError>>>,
-    path_events: Vec<Sender<PathEvent>>,
-    observed_external_addr: Option<SocketAddr>,
-    nat_traversal_updates: Vec<Sender<n0_nat_traversal::Event>>,
+    // Pending path-open waiters keyed by path ID; established paths live in `conn`.
+    open_path: HashMap<PathId, Broadcast<Result<(), PathError>>>,
+    path_events: Broadcast<PathEvent>,
+    observed_external_addr: Watch<Option<SocketAddr>>,
+    nat_traversal_updates: Broadcast<n0_nat_traversal::Event>,
     on_closed: Vec<Sender<Closed>>,
     final_path_stats: HashMap<PathId, PathStats>,
     path_refs: HashMap<PathId, usize>,
@@ -95,7 +101,7 @@ impl ConnectionState {
             e.drain(..).for_each(Waker::wake);
         }
         for tx in self.open_path.drain().map(|(_, tx)| tx) {
-            let _ = tx.send(Err(PathError::ValidationFailed));
+            tx.send(Err(PathError::ValidationFailed));
         }
         wake_all_streams(&mut self.writable);
         wake_all_streams(&mut self.readable);
@@ -185,14 +191,10 @@ fn push_waker_if_not_last(wakers: &mut VecDeque<Waker>, waker: &Waker) {
     }
 }
 
-fn broadcast<T: Clone>(listeners: &mut Vec<Sender<T>>, event: T) {
-    listeners.retain(|tx| tx.send(event.clone()).is_ok());
-}
-
-fn normalize_remote_address(
+fn normalize_network_path(
     state: &ConnectionState,
-    addr: SocketAddr,
-) -> Result<SocketAddr, PathError> {
+    network_path: FourTuple,
+) -> Result<FourTuple, PathError> {
     let ipv6 = state
         .conn
         .paths()
@@ -201,10 +203,11 @@ fn normalize_remote_address(
         .map(|path| path.remote().is_ipv6())
         .next()
         .unwrap_or_default();
+    let addr = network_path.remote();
     if addr.is_ipv6() && !ipv6 {
         return Err(PathError::InvalidRemoteAddress(addr));
     }
-    Ok(if ipv6 {
+    let addr = if ipv6 {
         SocketAddr::V6(match addr {
             SocketAddr::V4(addr) => {
                 SocketAddrV6::new(addr.ip().to_ipv6_mapped(), addr.port(), 0, 0)
@@ -213,7 +216,8 @@ fn normalize_remote_address(
         })
     } else {
         addr
-    })
+    };
+    Ok(FourTuple::new(addr, network_path.local_ip()))
 }
 
 pub(crate) struct ConnectionInner {
@@ -262,9 +266,9 @@ impl ConnectionInner {
                 stream_opened: [VecDeque::new(), VecDeque::new()],
                 stream_available: [VecDeque::new(), VecDeque::new()],
                 open_path: HashMap::default(),
-                path_events: Vec::new(),
-                observed_external_addr: None,
-                nat_traversal_updates: Vec::new(),
+                path_events: Broadcast::new(32),
+                observed_external_addr: Watch::new(None),
+                nat_traversal_updates: Broadcast::new(32),
                 on_closed: Vec::new(),
                 final_path_stats: HashMap::default(),
                 path_refs: HashMap::default(),
@@ -317,10 +321,8 @@ impl ConnectionInner {
             .collect()
     }
 
-    pub(crate) fn subscribe_path_events(inner: &Shared<ConnectionInner>) -> Receiver<PathEvent> {
-        let (tx, rx) = unbounded();
-        inner.state().path_events.push(tx);
-        rx
+    pub(crate) fn subscribe_path_events(inner: &Shared<ConnectionInner>) -> PathEvents {
+        PathEvents::new(inner.state().path_events.subscribe())
     }
 
     pub(crate) fn all_path_stats(&self) -> HashMap<PathId, PathStats> {
@@ -398,6 +400,15 @@ impl ConnectionInner {
                         match event {
                             ConnectionEvent::Close(error_code, reason) => state.close(error_code, reason),
                             ConnectionEvent::Proto(event) => state.conn.handle_event(event),
+                            ConnectionEvent::Rebind => {
+                                state.conn.handle_network_change(None, Instant::now());
+                            }
+                            ConnectionEvent::LocalAddressChanged(hint) => {
+                                state.conn.handle_network_change(
+                                    hint.as_deref().map(|hint| hint as &dyn NetworkChangeHint),
+                                    Instant::now(),
+                                );
+                            }
                         }
                     }
                     state
@@ -471,8 +482,8 @@ impl ConnectionInner {
                     Stream(StreamEvent::Opened { dir }) => state.stream_opened[dir as usize]
                         .drain(..)
                         .for_each(Waker::wake),
-                    DatagramReceived => state.datagram_received.drain(..).for_each(Waker::wake),
-                    DatagramsUnblocked => state.datagrams_unblocked.drain(..).for_each(Waker::wake),
+                    DatagramReceived => wake_waiters(&mut state.datagram_received),
+                    DatagramsUnblocked => wake_waiters(&mut state.datagrams_unblocked),
 
                     HandshakeConfirmed => {
                         state.handshake_confirmed = true;
@@ -482,16 +493,19 @@ impl ConnectionInner {
                         // PathEvent variants are #[non_exhaustive], use `..` in patterns
                         match &event {
                             PathEvent::ObservedAddr { addr, .. } => {
-                                state.observed_external_addr = Some(*addr);
+                                state.observed_external_addr.send_if_modified(|value| {
+                                    let old = value.replace(*addr);
+                                    old != *value
+                                });
                             }
                             PathEvent::Established { id, .. } => {
                                 if let Some(tx) = state.open_path.remove(id) {
-                                    let _ = tx.send(Ok(()));
+                                    tx.send(Ok(()));
                                 }
                             }
                             PathEvent::Abandoned { id, .. } => {
                                 if let Some(tx) = state.open_path.remove(id) {
-                                    let _ = tx.send(Err(PathError::ValidationFailed));
+                                    tx.send(Err(PathError::ValidationFailed));
                                 }
                             }
                             PathEvent::Discarded { id, path_stats, .. } => {
@@ -503,10 +517,10 @@ impl ConnectionInner {
                             // Future-proofing: PathEvent is #[non_exhaustive]
                             _ => {}
                         }
-                        broadcast(&mut state.path_events, event);
+                        state.path_events.send(event);
                     }
                     NatTraversal(event) => {
-                        broadcast(&mut state.nat_traversal_updates, event);
+                        state.nat_traversal_updates.send(event);
                     }
                 }
             }
@@ -1070,24 +1084,55 @@ impl Connection {
         self.0.try_state().err()
     }
 
-    /// Opens an additional path if multipath is negotiated.
-    pub fn open_path(
+    /// Opens a new path if no path exists yet for `network_path`.
+    pub fn open_path_ensure(
         &self,
-        addr: SocketAddr,
-        local_ip: Option<IpAddr>,
+        network_path: impl Into<FourTuple>,
         initial_status: PathStatus,
     ) -> OpenPath {
         let mut state = self.0.state();
-        let addr = match normalize_remote_address(&state, addr) {
-            Ok(addr) => addr,
+        let network_path = match normalize_network_path(&state, network_path.into()) {
+            Ok(network_path) => network_path,
             Err(err) => return OpenPath::rejected(err),
         };
-        let (tx, rx) = flume::bounded(1);
-        let result = state.conn.open_path(
-            FourTuple::new(addr, local_ip),
-            initial_status,
-            Instant::now(),
-        );
+        let result = state
+            .conn
+            .open_path_ensure(network_path, initial_status, Instant::now());
+        match result {
+            Ok((path_id, true)) => {
+                if let Some(tx) = state.open_path.get(&path_id) {
+                    OpenPath::new(path_id, tx.subscribe(), self.0.clone())
+                } else {
+                    OpenPath::ready(path_id, self.0.clone())
+                }
+            }
+            Ok((path_id, false)) => {
+                let tx = Broadcast::new(1);
+                let rx = tx.subscribe();
+                state.open_path.insert(path_id, tx);
+                state.wake();
+                OpenPath::new(path_id, rx, self.0.clone())
+            }
+            Err(err) => OpenPath::rejected(err),
+        }
+    }
+
+    /// Opens an additional path if multipath is negotiated.
+    pub fn open_path(
+        &self,
+        network_path: impl Into<FourTuple>,
+        initial_status: PathStatus,
+    ) -> OpenPath {
+        let mut state = self.0.state();
+        let network_path = match normalize_network_path(&state, network_path.into()) {
+            Ok(network_path) => network_path,
+            Err(err) => return OpenPath::rejected(err),
+        };
+        let tx = Broadcast::new(1);
+        let rx = tx.subscribe();
+        let result = state
+            .conn
+            .open_path(network_path, initial_status, Instant::now());
         match result {
             Ok(path_id) => {
                 state.open_path.insert(path_id, tx);
@@ -1111,8 +1156,8 @@ impl Connection {
         initial_status: PathStatus,
     ) -> Result<OpenPath, io::Error> {
         let mut state = self.0.state();
-        let addr = match normalize_remote_address(&state, addr) {
-            Ok(addr) => addr,
+        let network_path = match normalize_network_path(&state, FourTuple::new(addr, None)) {
+            Ok(network_path) => network_path,
             Err(err) => return Ok(OpenPath::rejected(err)),
         };
 
@@ -1134,9 +1179,10 @@ impl Connection {
         }
         spawn_recv_task(&self.0.sockets, &socket, max_payload);
 
-        let (tx, rx) = flume::bounded(1);
+        let tx = Broadcast::new(1);
+        let rx = tx.subscribe();
         let result = state.conn.open_path(
-            FourTuple::new(addr, local_ip),
+            FourTuple::new(network_path.remote(), local_ip),
             initial_status,
             Instant::now(),
         );
@@ -1156,10 +1202,8 @@ impl Connection {
     }
 
     /// Subscribe to path events for this connection.
-    pub fn path_events(&self) -> Receiver<PathEvent> {
-        let (tx, rx) = unbounded();
-        self.0.state().path_events.push(tx);
-        rx
+    pub fn path_events(&self) -> PathEvents {
+        PathEvents::new(self.0.state().path_events.subscribe())
     }
 
     /// Returns the path handles.
@@ -1186,15 +1230,13 @@ impl Connection {
     }
 
     /// Subscribe to NAT traversal updates for this connection.
-    pub fn nat_traversal_updates(&self) -> Receiver<n0_nat_traversal::Event> {
-        let (tx, rx) = unbounded();
-        self.0.state().nat_traversal_updates.push(tx);
-        rx
+    pub fn nat_traversal_updates(&self) -> NatTraversalUpdates {
+        NatTraversalUpdates::new(self.0.state().nat_traversal_updates.subscribe())
     }
 
     /// The latest external address observed by the peer.
-    pub fn observed_external_addr(&self) -> Option<SocketAddr> {
-        self.0.state().observed_external_addr
+    pub fn observed_external_addr(&self) -> ObservedExternalAddr {
+        ObservedExternalAddr::new(self.0.state().observed_external_addr.subscribe())
     }
 
     /// Statistics for a specific path.
@@ -1289,9 +1331,8 @@ impl Connection {
                 Disabled => Ok(SendDatagramError::Disabled),
                 TooLarge => Ok(SendDatagramError::TooLarge),
                 Blocked(data) => {
-                    state
-                        .datagrams_unblocked
-                        .push_back(cx.unwrap().waker().clone());
+                    let cx = cx.expect("blocked datagram sends are only possible when waiting");
+                    state.datagrams_unblocked.push_back(cx.waker().clone());
                     Err(data)
                 }
             })?;

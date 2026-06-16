@@ -4,7 +4,8 @@ use std::{
 };
 
 use comnoq::{
-    Endpoint, PathError, PathEvent, PathId, PathStatus, TransportConfig, n0_nat_traversal,
+    Endpoint, FourTuple, PathError, PathEvent, PathId, PathStatus, TransportConfig,
+    n0_nat_traversal,
 };
 use futures_util::{FutureExt, StreamExt, join};
 
@@ -114,10 +115,13 @@ async fn open_path_with_local_ip() {
     assert!(client.is_multipath_enabled());
 
     let local_ip = client_endpoint.local_addr().unwrap().ip();
-    let path_events = client.path_events();
+    let mut path_events = client.path_events();
     let path = loop {
         match client
-            .open_path(server_addr, Some(local_ip), PathStatus::Available)
+            .open_path(
+                FourTuple::new(server_addr, Some(local_ip)),
+                PathStatus::Available,
+            )
             .await
         {
             Ok(path) => break path,
@@ -132,7 +136,7 @@ async fn open_path_with_local_ip() {
     assert_eq!(path.local_ip().unwrap(), Some(local_ip));
 
     loop {
-        let event = path_events.recv_async().await.unwrap();
+        let event = path_events.next().await.unwrap().unwrap();
         if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
             break;
         }
@@ -171,7 +175,7 @@ async fn open_path_with_new_socket() {
     let new_socket = compio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let new_local_addr = new_socket.local_addr().unwrap();
 
-    let path_events = client.path_events();
+    let mut path_events = client.path_events();
     let open_path = client
         .open_path_socket(server_addr, new_socket, PathStatus::Available)
         .unwrap();
@@ -184,11 +188,46 @@ async fn open_path_with_new_socket() {
     assert_eq!(path.local_ip().unwrap(), Some(new_local_addr.ip()));
 
     loop {
-        let event = path_events.recv_async().await.unwrap();
+        let event = path_events.next().await.unwrap().unwrap();
         if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
             break;
         }
     }
+
+    drop(path);
+    drop(server);
+    drop(client);
+    client_endpoint.shutdown().await.unwrap();
+    server_endpoint.shutdown().await.unwrap();
+}
+
+#[compio::test]
+async fn open_path_ensure_existing_path() {
+    let _guard = subscribe();
+
+    let mut transport = TransportConfig::default();
+    transport.max_concurrent_multipath_paths(1);
+    let (client_endpoint, server_endpoint) = endpoint_pair_with_transport(transport).await;
+    let server_addr = server_endpoint.local_addr().unwrap();
+
+    let (client, server) = join!(
+        async {
+            client_endpoint
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        async { server_endpoint.accept().await.unwrap().await.unwrap() },
+    );
+
+    let fut = client.open_path_ensure(FourTuple::from_remote(server_addr), PathStatus::Available);
+    let expected_path_id = fut
+        .path_id()
+        .expect("open_path_ensure should allocate or reuse a path id");
+    let path = fut.await.expect("open_path_ensure should succeed");
+    assert_eq!(path.id(), expected_path_id);
+    assert_eq!(path.remote_address().unwrap(), server_addr);
 
     drop(path);
     drop(server);
@@ -220,12 +259,9 @@ async fn handshake_confirmed_and_open_path_event() {
     client.handshake_confirmed().await.unwrap();
     assert!(client.is_multipath_enabled());
 
-    let path_events = client.path_events();
+    let mut path_events = client.path_events();
     let path = loop {
-        match client
-            .open_path(server_addr, None, PathStatus::Available)
-            .await
-        {
+        match client.open_path(server_addr, PathStatus::Available).await {
             Ok(path) => break path,
             Err(PathError::RemoteCidsExhausted) => {
                 compio::runtime::time::sleep(Duration::from_millis(10)).await;
@@ -238,7 +274,7 @@ async fn handshake_confirmed_and_open_path_event() {
     let _stats = path.stats();
 
     loop {
-        let event = path_events.recv_async().await.unwrap();
+        let event = path_events.next().await.unwrap().unwrap();
         if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
             break;
         }
@@ -274,12 +310,9 @@ async fn discarded_path_stats_are_retained() {
     client.handshake_confirmed().await.unwrap();
     assert!(client.is_multipath_enabled());
 
-    let path_events = client.path_events();
+    let mut path_events = client.path_events();
     let path = loop {
-        match client
-            .open_path(server_addr, None, PathStatus::Available)
-            .await
-        {
+        match client.open_path(server_addr, PathStatus::Available).await {
             Ok(path) => break path,
             Err(PathError::RemoteCidsExhausted) => {
                 compio::runtime::time::sleep(Duration::from_millis(10)).await;
@@ -289,7 +322,7 @@ async fn discarded_path_stats_are_retained() {
     };
 
     loop {
-        let event = path_events.recv_async().await.unwrap();
+        let event = path_events.next().await.unwrap().unwrap();
         if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
             break;
         }
@@ -298,7 +331,7 @@ async fn discarded_path_stats_are_retained() {
     path.close().unwrap();
 
     loop {
-        let event = path_events.recv_async().await.unwrap();
+        let event = path_events.next().await.unwrap().unwrap();
         if matches!(event, PathEvent::Discarded { id, .. } if id == path.id()) {
             break;
         }
@@ -347,12 +380,12 @@ async fn handshake_confirmed_and_open_path_event_dual_stack() {
     client.handshake_confirmed().await.unwrap();
     assert!(client.is_multipath_enabled());
 
-    let path_events = client.path_events();
+    let mut path_events = client.path_events();
     let mut ipv6_server_addr = ipv4_server_addr;
     ipv6_server_addr.set_ip("::1".parse().unwrap());
     let path = loop {
         match client
-            .open_path(ipv6_server_addr, None, PathStatus::Available)
+            .open_path(ipv6_server_addr, PathStatus::Available)
             .await
         {
             Ok(path) => break path,
@@ -367,7 +400,7 @@ async fn handshake_confirmed_and_open_path_event_dual_stack() {
     let _stats = path.stats();
 
     loop {
-        let event = path_events.recv_async().await.unwrap();
+        let event = path_events.next().await.unwrap().unwrap();
         if matches!(event, PathEvent::Established { id, .. } if id == path.id()) {
             break;
         }
@@ -402,11 +435,11 @@ async fn nat_traversal_updates_are_forwarded() {
 
     client.handshake_confirmed().await.unwrap();
 
-    let updates = client.nat_traversal_updates();
+    let mut updates = client.nat_traversal_updates();
     let added_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
     server.add_nat_traversal_address(added_addr).unwrap();
 
-    let event = updates.recv_async().await.unwrap();
+    let event = updates.next().await.unwrap().unwrap();
     assert!(matches!(event, n0_nat_traversal::Event::AddressAdded(addr) if addr == added_addr));
     assert_eq!(
         client.get_remote_nat_traversal_addresses().unwrap(),

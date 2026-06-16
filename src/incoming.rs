@@ -157,8 +157,8 @@ impl Future for IncomingFuture {
 }
 
 impl IntoFuture for Incoming {
-    type IntoFuture = IncomingFuture;
     type Output = Result<Connection, ConnectionError>;
+    type IntoFuture = IncomingFuture;
 
     fn into_future(self) -> Self::IntoFuture {
         IncomingFuture(self.accept())
