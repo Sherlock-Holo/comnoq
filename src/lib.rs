@@ -7,6 +7,9 @@
 #![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+#[cfg(all(feature = "ring", feature = "graviola"))]
+compile_error!("features `ring` and `graviola` are mutually exclusive");
+
 use std::time::Duration;
 
 #[cfg(feature = "qlog")]
@@ -26,6 +29,8 @@ pub use noq_proto::{
 #[cfg(rustls)]
 mod builder;
 mod connection;
+#[cfg(all(feature = "graviola", not(feature = "ring")))]
+pub(crate) mod crypto_graviola;
 mod endpoint;
 mod event_stream;
 mod incoming;

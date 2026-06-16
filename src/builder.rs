@@ -8,6 +8,18 @@ use noq_proto::{
 
 use crate::Endpoint;
 
+fn ensure_crypto_provider() {
+    #[cfg(feature = "graviola")]
+    {
+        use std::sync::OnceLock;
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            // User may have already installed their own provider; ignore the error.
+            let _ = rustls_graviola::default_provider().install_default();
+        });
+    }
+}
+
 /// Helper to construct an [`Endpoint`] for use with outgoing connections only.
 ///
 /// To get one, call `new_with_xxx` methods.
@@ -146,6 +158,7 @@ impl ClientBuilder<rustls::ClientConfig> {
 
     /// Build a [`ClientConfig`].
     pub fn build(mut self) -> ClientConfig {
+        ensure_crypto_provider();
         self.0.enable_early_data = true;
         ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(self.0).expect("should support TLS13_AES_128_GCM_SHA256"),
@@ -207,11 +220,21 @@ impl ServerBuilder<rustls::ServerConfig> {
     }
 
     /// Build a [`ServerConfig`].
+    #[cfg(rustls)]
     pub fn build(mut self) -> ServerConfig {
+        ensure_crypto_provider();
         self.0.max_early_data_size = u32::MAX;
-        ServerConfig::with_crypto(Arc::new(
+        let crypto = Arc::new(
             QuicServerConfig::try_from(self.0).expect("should support TLS13_AES_128_GCM_SHA256"),
-        ))
+        );
+        #[cfg(feature = "ring")]
+        {
+            ServerConfig::with_crypto(crypto)
+        }
+        #[cfg(all(feature = "graviola", not(feature = "ring")))]
+        {
+            crate::crypto_graviola::graviola_server_with_crypto(crypto)
+        }
     }
 
     /// Create a new [`Endpoint`].
@@ -239,8 +262,10 @@ mod verifier {
                 rustls::crypto::CryptoProvider::get_default()
                     .map(|provider| provider.signature_verification_algorithms)
                     .unwrap_or_else(|| {
-                        #[cfg(feature = "ring")]
+                        #[cfg(all(feature = "ring", not(feature = "graviola")))]
                         use rustls::crypto::ring::default_provider;
+                        #[cfg(feature = "graviola")]
+                        use rustls_graviola::default_provider;
                         default_provider().signature_verification_algorithms
                     }),
             )

@@ -576,7 +576,7 @@ impl Endpoint {
     pub async fn client(addr: impl ToSocketAddrsAsync) -> io::Result<Endpoint> {
         // TODO: try to enable dual-stack on all platforms, notably Windows
         let socket = UdpSocket::bind(addr).await?;
-        Self::new(socket, EndpointConfig::default(), None, None)
+        Self::new(socket, endpoint_config(), None, None)
     }
 
     /// Helper to construct an endpoint for use with both incoming and outgoing
@@ -590,7 +590,7 @@ impl Endpoint {
     #[cfg(rustls)]
     pub async fn server(addr: impl ToSocketAddrsAsync, config: ServerConfig) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        Self::new(socket, EndpointConfig::default(), Some(config), None)
+        Self::new(socket, endpoint_config(), Some(config), None)
     }
 
     /// Returns relevant stats from this Endpoint
@@ -780,5 +780,17 @@ impl Future for Accept<'_> {
             .map(|incoming| {
                 incoming.map(|incoming| Incoming::new(incoming, self.endpoint.inner.clone()))
             })
+    }
+}
+
+#[cfg(rustls)]
+fn endpoint_config() -> EndpointConfig {
+    #[cfg(feature = "ring")]
+    {
+        EndpointConfig::default()
+    }
+    #[cfg(all(feature = "graviola", not(feature = "ring")))]
+    {
+        crate::crypto_graviola::graviola_endpoint_config()
     }
 }
