@@ -1,16 +1,23 @@
+#[cfg(not(feature = "sync"))]
+use std::rc::Weak as WeakShared;
+#[cfg(feature = "sync")]
+use std::sync::Weak as WeakShared;
 use std::{
     collections::VecDeque,
     fmt::Debug,
+    io,
     net::{IpAddr, SocketAddr, SocketAddrV6},
     pin::{Pin, pin},
+    sync::Arc,
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
 
 use compio::buf::bytes::Bytes;
+use compio::net::UdpSocket;
 use compio::runtime::JoinHandle;
 use compio_log::Instrument;
-use flume::{Receiver, Sender, unbounded};
+use flume::{Receiver, Sender};
 use futures_util::{
     FutureExt, StreamExt,
     future::{self, Fuse, FusedFuture, LocalBoxFuture},
@@ -19,15 +26,18 @@ use futures_util::{
 #[cfg(rustls)]
 use noq_proto::crypto::rustls::HandshakeData;
 use noq_proto::{
-    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, FourTuple, PathError, PathEvent, PathId,
-    PathStats, PathStatus, Side, StreamEvent, StreamId, VarInt, congestion::Controller,
-    n0_nat_traversal,
+    ConnectionHandle, ConnectionStats, Dir, EndpointEvent, FourTuple, NetworkChangeHint, PathError,
+    PathEvent, PathId, PathStats, PathStatus, Side, StreamEvent, StreamId, VarInt,
+    congestion::Controller, n0_nat_traversal,
 };
 use rustc_hash::FxHashMap as HashMap;
 use thiserror::Error;
 
 use crate::{
-    OpenPath, Path, RecvStream, SendStream, Socket,
+    NatTraversalUpdates, ObservedExternalAddr, OpenPath, Path, PathEvents, RecvStream, SendStream,
+    Socket, SocketEntry, SocketSet,
+    event_stream::{Broadcast, Watch},
+    select_socket, spawn_recv_task,
     sync::{
         mutex_blocking::{Mutex, MutexGuard},
         shared::Shared,
@@ -38,6 +48,8 @@ use crate::{
 pub(crate) enum ConnectionEvent {
     Close(VarInt, Bytes),
     Proto(noq_proto::ConnectionEvent),
+    Rebind,
+    LocalAddressChanged(Option<Arc<dyn NetworkChangeHint + Send + Sync>>),
 }
 
 #[derive(Debug)]
@@ -55,10 +67,12 @@ pub(crate) struct ConnectionState {
     datagrams_unblocked: VecDeque<Waker>,
     stream_opened: [VecDeque<Waker>; 2],
     stream_available: [VecDeque<Waker>; 2],
-    open_path: HashMap<PathId, Sender<Result<(), PathError>>>,
-    path_events: Vec<Sender<PathEvent>>,
-    observed_external_addr: Option<SocketAddr>,
-    nat_traversal_updates: Vec<Sender<n0_nat_traversal::Event>>,
+    // Pending path-open waiters keyed by path ID; established paths live in `conn`.
+    open_path: HashMap<PathId, Broadcast<Result<(), PathError>>>,
+    path_events: Broadcast<PathEvent>,
+    observed_external_addr: Watch<Option<SocketAddr>>,
+    nat_traversal_updates: Broadcast<n0_nat_traversal::Event>,
+    on_closed: Vec<Sender<Closed>>,
     final_path_stats: HashMap<PathId, PathStats>,
     path_refs: HashMap<PathId, usize>,
     pub(crate) writable: HashMap<StreamId, Waker>,
@@ -68,7 +82,7 @@ pub(crate) struct ConnectionState {
 
 impl ConnectionState {
     fn terminate(&mut self, reason: ConnectionError) {
-        self.error = Some(reason);
+        self.error = Some(reason.clone());
         self.connected = false;
 
         if let Some(waker) = self.on_handshake_data.take() {
@@ -87,11 +101,18 @@ impl ConnectionState {
             e.drain(..).for_each(Waker::wake);
         }
         for tx in self.open_path.drain().map(|(_, tx)| tx) {
-            let _ = tx.send(Err(PathError::ValidationFailed));
+            tx.send(Err(PathError::ValidationFailed));
         }
         wake_all_streams(&mut self.writable);
         wake_all_streams(&mut self.readable);
         wake_all_streams(&mut self.stopped);
+
+        if !self.on_closed.is_empty() {
+            let closed = Closed::new(self, reason);
+            for tx in self.on_closed.drain(..) {
+                let _ = tx.send(closed.clone());
+            }
+        }
     }
 
     fn close(&mut self, error_code: VarInt, reason: Bytes) {
@@ -163,14 +184,17 @@ fn push_waker_dedup(wakers: &mut VecDeque<Waker>, waker: &Waker) {
     wakers.push_back(waker.clone());
 }
 
-fn broadcast<T: Clone>(listeners: &mut Vec<Sender<T>>, event: T) {
-    listeners.retain(|tx| tx.send(event.clone()).is_ok());
+fn push_waker_if_not_last(wakers: &mut VecDeque<Waker>, waker: &Waker) {
+    match wakers.back() {
+        Some(existing) if existing.will_wake(waker) => {}
+        _ => wakers.push_back(waker.clone()),
+    }
 }
 
-fn normalize_remote_address(
+fn normalize_network_path(
     state: &ConnectionState,
-    addr: SocketAddr,
-) -> Result<SocketAddr, PathError> {
+    network_path: FourTuple,
+) -> Result<FourTuple, PathError> {
     let ipv6 = state
         .conn
         .paths()
@@ -179,10 +203,11 @@ fn normalize_remote_address(
         .map(|path| path.remote().is_ipv6())
         .next()
         .unwrap_or_default();
+    let addr = network_path.remote();
     if addr.is_ipv6() && !ipv6 {
         return Err(PathError::InvalidRemoteAddress(addr));
     }
-    Ok(if ipv6 {
+    let addr = if ipv6 {
         SocketAddr::V6(match addr {
             SocketAddr::V4(addr) => {
                 SocketAddrV6::new(addr.ip().to_ipv6_mapped(), addr.port(), 0, 0)
@@ -191,16 +216,24 @@ fn normalize_remote_address(
         })
     } else {
         addr
-    })
+    };
+    Ok(FourTuple::new(addr, network_path.local_ip()))
 }
 
-#[derive(Debug)]
 pub(crate) struct ConnectionInner {
     state: Mutex<ConnectionState>,
     handle: ConnectionHandle,
-    socket: Socket,
+    pub(crate) sockets: SocketSet,
     events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
     events_rx: Receiver<ConnectionEvent>,
+}
+
+impl std::fmt::Debug for ConnectionInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionInner")
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
 }
 
 fn implicit_close(this: &Shared<ConnectionInner>) {
@@ -213,7 +246,7 @@ impl ConnectionInner {
     fn new(
         handle: ConnectionHandle,
         conn: noq_proto::Connection,
-        socket: Socket,
+        sockets: SocketSet,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
         events_rx: Receiver<ConnectionEvent>,
     ) -> Self {
@@ -233,9 +266,10 @@ impl ConnectionInner {
                 stream_opened: [VecDeque::new(), VecDeque::new()],
                 stream_available: [VecDeque::new(), VecDeque::new()],
                 open_path: HashMap::default(),
-                path_events: Vec::new(),
-                observed_external_addr: None,
-                nat_traversal_updates: Vec::new(),
+                path_events: Broadcast::new(32),
+                observed_external_addr: Watch::new(None),
+                nat_traversal_updates: Broadcast::new(32),
+                on_closed: Vec::new(),
                 final_path_stats: HashMap::default(),
                 path_refs: HashMap::default(),
                 writable: HashMap::default(),
@@ -243,7 +277,7 @@ impl ConnectionInner {
                 stopped: HashMap::default(),
             }),
             handle,
-            socket,
+            sockets,
             events_tx,
             events_rx,
         }
@@ -265,9 +299,11 @@ impl ConnectionInner {
     }
 
     pub(crate) fn path(inner: &Shared<Self>, id: PathId) -> Option<Path> {
-        inner.state.lock().conn.path_status(id).ok()?;
-
-        Some(Path::new_unchecked(inner.clone(), id))
+        let mut state = inner.state.lock();
+        state.conn.path_status(id).ok()?;
+        state.increment_path_refs(id);
+        drop(state);
+        Some(Path::new_unchecked_without_ref(inner.clone(), id))
     }
 
     pub(crate) fn paths(inner: &Shared<ConnectionInner>) -> Vec<Path> {
@@ -285,10 +321,8 @@ impl ConnectionInner {
             .collect()
     }
 
-    pub(crate) fn subscribe_path_events(inner: &Shared<ConnectionInner>) -> Receiver<PathEvent> {
-        let (tx, rx) = unbounded();
-        inner.state().path_events.push(tx);
-        rx
+    pub(crate) fn subscribe_path_events(inner: &Shared<ConnectionInner>) -> PathEvents {
+        PathEvents::new(inner.state().path_events.subscribe())
     }
 
     pub(crate) fn all_path_stats(&self) -> HashMap<PathId, PathStats> {
@@ -366,6 +400,15 @@ impl ConnectionInner {
                         match event {
                             ConnectionEvent::Close(error_code, reason) => state.close(error_code, reason),
                             ConnectionEvent::Proto(event) => state.conn.handle_event(event),
+                            ConnectionEvent::Rebind => {
+                                state.conn.handle_network_change(None, Instant::now());
+                            }
+                            ConnectionEvent::LocalAddressChanged(hint) => {
+                                state.conn.handle_network_change(
+                                    hint.as_deref().map(|hint| hint as &dyn NetworkChangeHint),
+                                    Instant::now(),
+                                );
+                            }
                         }
                     }
                     state
@@ -380,12 +423,19 @@ impl ConnectionInner {
             };
 
             if let Some(mut buf) = send_buf.take() {
-                if let Some(transmit) = state.conn.poll_transmit(
-                    Instant::now(),
-                    self.socket.max_gso_segments(),
-                    &mut buf,
-                ) {
-                    transmit_fut.set(async move { self.socket.send(buf, &transmit).await }.fuse())
+                let default_socket = select_socket(&self.sockets, None);
+                let default_max_gso = default_socket.max_gso_segments();
+                if let Some(transmit) =
+                    state
+                        .conn
+                        .poll_transmit(Instant::now(), default_max_gso, &mut buf)
+                {
+                    let socket = if transmit.src_ip.is_some() {
+                        select_socket(&self.sockets, transmit.src_ip)
+                    } else {
+                        default_socket
+                    };
+                    transmit_fut.set(async move { socket.send(buf, &transmit).await }.fuse())
                 } else {
                     send_buf = Some(buf);
                 }
@@ -432,39 +482,45 @@ impl ConnectionInner {
                     Stream(StreamEvent::Opened { dir }) => state.stream_opened[dir as usize]
                         .drain(..)
                         .for_each(Waker::wake),
-                    DatagramReceived => state.datagram_received.drain(..).for_each(Waker::wake),
-                    DatagramsUnblocked => state.datagrams_unblocked.drain(..).for_each(Waker::wake),
+                    DatagramReceived => wake_waiters(&mut state.datagram_received),
+                    DatagramsUnblocked => wake_waiters(&mut state.datagrams_unblocked),
 
                     HandshakeConfirmed => {
                         state.handshake_confirmed = true;
                         wake_waiters(&mut state.on_handshake_confirmed);
                     }
                     Path(event) => {
+                        // PathEvent variants are #[non_exhaustive], use `..` in patterns
                         match &event {
                             PathEvent::ObservedAddr { addr, .. } => {
-                                state.observed_external_addr = Some(*addr);
+                                state.observed_external_addr.send_if_modified(|value| {
+                                    let old = value.replace(*addr);
+                                    old != *value
+                                });
                             }
-                            PathEvent::Opened { id } => {
+                            PathEvent::Established { id, .. } => {
                                 if let Some(tx) = state.open_path.remove(id) {
-                                    let _ = tx.send(Ok(()));
+                                    tx.send(Ok(()));
                                 }
                             }
                             PathEvent::Abandoned { id, .. } => {
                                 if let Some(tx) = state.open_path.remove(id) {
-                                    let _ = tx.send(Err(PathError::ValidationFailed));
+                                    tx.send(Err(PathError::ValidationFailed));
                                 }
                             }
-                            PathEvent::Discarded { id, path_stats } => {
+                            PathEvent::Discarded { id, path_stats, .. } => {
                                 if state.path_refs.contains_key(id) {
                                     state.final_path_stats.insert(*id, **path_stats);
                                 }
                             }
                             PathEvent::RemoteStatus { .. } => {}
+                            // Future-proofing: PathEvent is #[non_exhaustive]
+                            _ => {}
                         }
-                        broadcast(&mut state.path_events, event);
+                        state.path_events.send(event);
                     }
                     NatTraversal(event) => {
-                        broadcast(&mut state.nat_traversal_updates, event);
+                        state.nat_traversal_updates.send(event);
                     }
                 }
             }
@@ -590,6 +646,92 @@ macro_rules! conn_fn {
     };
 }
 
+/// State of a [`Connection`] at the moment it was closed.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Closed {
+    /// The reason the connection was closed.
+    pub reason: ConnectionError,
+    /// Aggregate connection statistics at the moment of close.
+    pub stats: ConnectionStats,
+    /// Per-path statistics for every path the connection knew about at close time.
+    pub path_stats: Vec<(PathId, PathStats)>,
+}
+
+impl Closed {
+    fn new(state: &mut ConnectionState, reason: ConnectionError) -> Self {
+        let stats = state.conn.stats();
+        let mut path_stats = Vec::new();
+        path_stats.extend(
+            state
+                .conn
+                .paths()
+                .into_iter()
+                .filter_map(|id| state.conn.path_stats(id).map(|stats| (id, stats))),
+        );
+        path_stats.extend(
+            state
+                .final_path_stats
+                .iter()
+                .map(|(id, stats)| (*id, *stats)),
+        );
+        Self {
+            reason,
+            stats,
+            path_stats,
+        }
+    }
+}
+
+/// Future returned by [`Connection::on_closed`].
+#[derive(Debug)]
+pub struct OnClosed {
+    rx: Receiver<Closed>,
+    conn: WeakConnectionHandle,
+}
+
+impl Future for OnClosed {
+    type Output = Closed;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let fut = self.rx.recv_async();
+        futures_util::pin_mut!(fut);
+        fut.poll(cx)
+            .map(|closed| closed.expect("on_closed sender is kept until connection termination"))
+    }
+}
+
+impl Drop for OnClosed {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.upgrade_inner() {
+            conn.state().on_closed.retain(|tx| !tx.is_disconnected());
+        }
+    }
+}
+
+/// Future that completes when a connection is fully established.
+#[derive(Debug, Clone)]
+pub struct ZeroRttAccepted(Shared<ConnectionInner>);
+
+impl Future for ZeroRttAccepted {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.0.state();
+        if state.connected {
+            return Poll::Ready(state.conn.accepted_0rtt());
+        }
+        if state.error.is_some() {
+            return Poll::Ready(false);
+        }
+        match &state.on_connected {
+            Some(waker) if waker.will_wake(cx.waker()) => {}
+            _ => state.on_connected = Some(cx.waker().clone()),
+        }
+        Poll::Pending
+    }
+}
+
 /// In-progress connection attempt future
 #[derive(Debug)]
 #[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
@@ -601,12 +743,12 @@ impl Connecting {
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: noq_proto::Connection,
-        socket: Socket,
+        sockets: SocketSet,
         events_tx: Sender<(ConnectionHandle, EndpointEvent)>,
         events_rx: Receiver<ConnectionEvent>,
     ) -> Self {
         let inner = Shared::new(ConnectionInner::new(
-            handle, conn, socket, events_tx, events_rx,
+            handle, conn, sockets, events_tx, events_rx,
         ));
         let worker = compio::runtime::spawn({
             let inner = inner.clone();
@@ -642,7 +784,7 @@ impl Connecting {
     /// sending 0/0.5-RTT data. If so, the returned [`Connection`] can be used
     /// to send application data without waiting for the rest of the handshake
     /// to complete, at the cost of weakened cryptographic security guarantees.
-    /// The [`Connection::accepted_0rtt`] method resolves when the handshake
+    /// The returned [`ZeroRttAccepted`] future resolves when the handshake
     /// does complete, at which point subsequently opened streams and written
     /// data will have full cryptographic protection.
     ///
@@ -653,10 +795,10 @@ impl Connecting {
     /// [`crypto::ClientConfig`][crate::crypto::ClientConfig] attempts to resume
     /// a previous TLS session. However, **the remote endpoint may not actually
     /// _accept_ the 0-RTT data**--yet still accept the connection attempt in
-    /// general. This possibility is conveyed through the
-    /// [`Connection::accepted_0rtt`] method--when the handshake completes, it
-    /// resolves to true if the 0-RTT data was accepted and false if it was
-    /// rejected. If it was rejected, the existence of streams opened and other
+    /// general. This possibility is conveyed through the returned
+    /// [`ZeroRttAccepted`] future--when the handshake completes, it resolves to
+    /// true if the 0-RTT data was accepted and false if it was rejected. If it
+    /// was rejected, the existence of streams opened and other
     /// application data sent prior to the handshake completing will not be
     /// conveyed to the remote application, and local operations on them will
     /// return `ZeroRttRejected` errors.
@@ -669,8 +811,8 @@ impl Connecting {
     /// ## Incoming
     ///
     /// For incoming connections, conversion to 0.5-RTT will always fully
-    /// succeed. `into_0rtt` will always return `Ok` and
-    /// [`Connection::accepted_0rtt`] will always resolve to true.
+    /// succeed. `into_0rtt` will always return `Ok` and the returned
+    /// [`ZeroRttAccepted`] future will always resolve to true.
     ///
     /// ## Security
     ///
@@ -682,13 +824,13 @@ impl Connecting {
     /// which may be sent before TLS client authentication has occurred, and
     /// should therefore not be used to send data for which client
     /// authentication is being used.
-    pub fn into_0rtt(self) -> Result<Connection, Self> {
+    pub fn into_0rtt(self) -> Result<(Connection, ZeroRttAccepted), Self> {
         let is_ok = {
             let state = self.0.state();
             state.conn.has_0rtt() || state.conn.side().is_server()
         };
         if is_ok {
-            Ok(Connection(self.0.clone()))
+            Ok((Connection(self.0.clone()), ZeroRttAccepted(self.0.clone())))
         } else {
             Err(self)
         }
@@ -724,8 +866,51 @@ impl Drop for Connecting {
 #[derive(Debug, Clone)]
 pub struct Connection(Shared<ConnectionInner>);
 
+/// Weak handle for a [`Connection`] that does not keep it alive.
+#[derive(Debug, Clone)]
+pub struct WeakConnectionHandle(WeakShared<ConnectionInner>);
+
+impl WeakConnectionHandle {
+    pub(crate) fn new(conn: &Shared<ConnectionInner>) -> Self {
+        Self(Shared::downgrade(conn))
+    }
+
+    pub(crate) fn upgrade_inner(&self) -> Option<Shared<ConnectionInner>> {
+        self.0.upgrade()
+    }
+
+    /// Upgrades to a [`Connection`].
+    pub fn upgrade(&self) -> Option<Connection> {
+        self.upgrade_inner().map(Connection)
+    }
+
+    pub(crate) fn is_same_connection(&self, other: &Self) -> bool {
+        WeakShared::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl Connection {
     conn_fn!();
+
+    /// Returns a weak reference to the inner connection struct.
+    pub fn weak_handle(&self) -> WeakConnectionHandle {
+        WeakConnectionHandle::new(&self.0)
+    }
+
+    /// Wait for the connection to be closed without keeping a strong reference to it.
+    pub fn on_closed(&self) -> OnClosed {
+        let (tx, rx) = flume::bounded(1);
+        let mut state = self.0.state();
+        if let Some(reason) = state.error.clone() {
+            let _ = tx.send(Closed::new(&mut state, reason));
+        } else {
+            state.on_closed.push(tx);
+        }
+        OnClosed {
+            rx,
+            conn: self.weak_handle(),
+        }
+    }
 
     /// Update traffic keys spontaneously
     ///
@@ -883,9 +1068,13 @@ impl Connection {
         let worker = self.0.state().worker.take();
         if let Some(worker) = worker {
             let _ = worker.await;
+            return self.0.try_state().unwrap_err();
         }
 
-        self.0.try_state().unwrap_err()
+        // Worker handle was already taken (e.g. by another Connection clone).
+        // Fall back to on_closed to wait for termination without clashing with
+        // the event loop's poller waker.
+        self.on_closed().await.reason
     }
 
     /// If the connection is closed, the reason why.
@@ -895,18 +1084,55 @@ impl Connection {
         self.0.try_state().err()
     }
 
-    /// Opens an additional path if multipath is negotiated.
-    pub fn open_path(&self, addr: SocketAddr, initial_status: PathStatus) -> OpenPath {
+    /// Opens a new path if no path exists yet for `network_path`.
+    pub fn open_path_ensure(
+        &self,
+        network_path: impl Into<FourTuple>,
+        initial_status: PathStatus,
+    ) -> OpenPath {
         let mut state = self.0.state();
-        let addr = match normalize_remote_address(&state, addr) {
-            Ok(addr) => addr,
+        let network_path = match normalize_network_path(&state, network_path.into()) {
+            Ok(network_path) => network_path,
             Err(err) => return OpenPath::rejected(err),
         };
-        let (tx, rx) = flume::bounded(1);
-        let result =
-            state
-                .conn
-                .open_path(FourTuple::new(addr, None), initial_status, Instant::now());
+        let result = state
+            .conn
+            .open_path_ensure(network_path, initial_status, Instant::now());
+        match result {
+            Ok((path_id, true)) => {
+                if let Some(tx) = state.open_path.get(&path_id) {
+                    OpenPath::new(path_id, tx.subscribe(), self.0.clone())
+                } else {
+                    OpenPath::ready(path_id, self.0.clone())
+                }
+            }
+            Ok((path_id, false)) => {
+                let tx = Broadcast::new(1);
+                let rx = tx.subscribe();
+                state.open_path.insert(path_id, tx);
+                state.wake();
+                OpenPath::new(path_id, rx, self.0.clone())
+            }
+            Err(err) => OpenPath::rejected(err),
+        }
+    }
+
+    /// Opens an additional path if multipath is negotiated.
+    pub fn open_path(
+        &self,
+        network_path: impl Into<FourTuple>,
+        initial_status: PathStatus,
+    ) -> OpenPath {
+        let mut state = self.0.state();
+        let network_path = match normalize_network_path(&state, network_path.into()) {
+            Ok(network_path) => network_path,
+            Err(err) => return OpenPath::rejected(err),
+        };
+        let tx = Broadcast::new(1);
+        let rx = tx.subscribe();
+        let result = state
+            .conn
+            .open_path(network_path, initial_status, Instant::now());
         match result {
             Ok(path_id) => {
                 state.open_path.insert(path_id, tx);
@@ -917,16 +1143,67 @@ impl Connection {
         }
     }
 
+    /// Opens an additional path using a new socket.
+    ///
+    /// The socket should already be bound to a local address (e.g., via
+    /// Android's `Network.bindSocket(fd)`). `local_ip` is derived from the
+    /// socket's bound address. The socket is registered with the endpoint
+    /// and a recv task is spawned automatically.
+    pub fn open_path_socket(
+        &self,
+        addr: SocketAddr,
+        socket: UdpSocket,
+        initial_status: PathStatus,
+    ) -> Result<OpenPath, io::Error> {
+        let mut state = self.0.state();
+        let network_path = match normalize_network_path(&state, FourTuple::new(addr, None)) {
+            Ok(network_path) => network_path,
+            Err(err) => return Ok(OpenPath::rejected(err)),
+        };
+
+        let socket = Socket::new(socket)?;
+        let local_addr = socket.local_addr()?;
+        let local_ip = match local_addr.ip() {
+            IpAddr::V4(a) if a.is_unspecified() => None,
+            IpAddr::V6(a) if a.is_unspecified() => None,
+            ip => Some(ip),
+        };
+
+        let max_payload = self.0.sockets.lock().unwrap().max_payload_size;
+        {
+            let mut shared = self.0.sockets.lock().unwrap();
+            shared.sockets.push(SocketEntry {
+                socket: socket.clone(),
+                local_ip,
+            });
+        }
+        spawn_recv_task(&self.0.sockets, &socket, max_payload);
+
+        let tx = Broadcast::new(1);
+        let rx = tx.subscribe();
+        let result = state.conn.open_path(
+            FourTuple::new(network_path.remote(), local_ip),
+            initial_status,
+            Instant::now(),
+        );
+        match result {
+            Ok(path_id) => {
+                state.open_path.insert(path_id, tx);
+                state.wake();
+                Ok(OpenPath::new(path_id, rx, self.0.clone()))
+            }
+            Err(err) => Ok(OpenPath::rejected(err)),
+        }
+    }
+
     /// Returns the path handle for an open path.
     pub fn path(&self, id: PathId) -> Option<Path> {
         ConnectionInner::path(&self.0, id)
     }
 
     /// Subscribe to path events for this connection.
-    pub fn path_events(&self) -> Receiver<PathEvent> {
-        let (tx, rx) = unbounded();
-        self.0.state().path_events.push(tx);
-        rx
+    pub fn path_events(&self) -> PathEvents {
+        PathEvents::new(self.0.state().path_events.subscribe())
     }
 
     /// Returns the path handles.
@@ -953,15 +1230,13 @@ impl Connection {
     }
 
     /// Subscribe to NAT traversal updates for this connection.
-    pub fn nat_traversal_updates(&self) -> Receiver<n0_nat_traversal::Event> {
-        let (tx, rx) = unbounded();
-        self.0.state().nat_traversal_updates.push(tx);
-        rx
+    pub fn nat_traversal_updates(&self) -> NatTraversalUpdates {
+        NatTraversalUpdates::new(self.0.state().nat_traversal_updates.subscribe())
     }
 
     /// The latest external address observed by the peer.
-    pub fn observed_external_addr(&self) -> Option<SocketAddr> {
-        self.0.state().observed_external_addr
+    pub fn observed_external_addr(&self) -> ObservedExternalAddr {
+        ObservedExternalAddr::new(self.0.state().observed_external_addr.subscribe())
     }
 
     /// Statistics for a specific path.
@@ -1036,7 +1311,7 @@ impl Connection {
     }
 
     /// Receive an application datagram.
-    pub async fn recv_datagram(&self) -> Result<Bytes, ConnectionError> {
+    pub async fn read_datagram(&self) -> Result<Bytes, ConnectionError> {
         future::poll_fn(|cx| self.poll_recv_datagram(cx)).await
     }
 
@@ -1056,9 +1331,8 @@ impl Connection {
                 Disabled => Ok(SendDatagramError::Disabled),
                 TooLarge => Ok(SendDatagramError::TooLarge),
                 Blocked(data) => {
-                    state
-                        .datagrams_unblocked
-                        .push_back(cx.unwrap().waker().clone());
+                    let cx = cx.expect("blocked datagram sends are only possible when waiting");
+                    state.datagrams_unblocked.push_back(cx.waker().clone());
                     Err(data)
                 }
             })?;
@@ -1118,58 +1392,44 @@ impl Connection {
         }
     }
 
-    /// Initiate a new outgoing unidirectional stream.
+    /// Initiate a new outgoing unidirectional stream immediately.
     ///
-    /// Streams are cheap and instantaneous to open. As a consequence, the peer
-    /// won't be notified that a stream has been opened until the stream is
-    /// actually used.
-    pub fn open_uni(&self) -> Result<SendStream, OpenStreamError> {
-        if let Poll::Ready((stream, is_0rtt)) = self.poll_open_stream(None, Dir::Uni)? {
-            Ok(SendStream::new(self.0.clone(), stream, is_0rtt))
-        } else {
-            Err(OpenStreamError::StreamsExhausted)
+    /// Returns [`OpenStreamError::StreamsExhausted`] instead of waiting if stream ID flow control
+    /// does not currently allow opening another stream.
+    pub fn try_open_uni(&self) -> Result<SendStream, OpenStreamError> {
+        match self.poll_open_stream(None, Dir::Uni) {
+            Poll::Ready(Ok((stream, is_0rtt))) => {
+                Ok(SendStream::new(self.0.clone(), stream, is_0rtt))
+            }
+            Poll::Ready(Err(e)) => Err(e.into()),
+            Poll::Pending => Err(OpenStreamError::StreamsExhausted),
         }
     }
 
     /// Initiate a new outgoing unidirectional stream.
-    ///
-    /// Unlike [`open_uni()`], this method will wait for the connection to allow
-    /// a new stream to be opened.
-    ///
-    /// See [`open_uni()`] for details.
-    ///
-    /// [`open_uni()`]: Connection::open_uni
-    pub async fn open_uni_wait(&self) -> Result<SendStream, ConnectionError> {
+    pub async fn open_uni(&self) -> Result<SendStream, ConnectionError> {
         let (stream, is_0rtt) =
             future::poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Uni)).await?;
         Ok(SendStream::new(self.0.clone(), stream, is_0rtt))
     }
 
-    /// Initiate a new outgoing bidirectional stream.
+    /// Initiate a new outgoing bidirectional stream immediately.
     ///
-    /// Streams are cheap and instantaneous to open. As a consequence, the peer
-    /// won't be notified that a stream has been opened until the stream is
-    /// actually used.
-    pub fn open_bi(&self) -> Result<(SendStream, RecvStream), OpenStreamError> {
-        if let Poll::Ready((stream, is_0rtt)) = self.poll_open_stream(None, Dir::Bi)? {
-            Ok((
+    /// Returns [`OpenStreamError::StreamsExhausted`] instead of waiting if stream ID flow control
+    /// does not currently allow opening another stream.
+    pub fn try_open_bi(&self) -> Result<(SendStream, RecvStream), OpenStreamError> {
+        match self.poll_open_stream(None, Dir::Bi) {
+            Poll::Ready(Ok((stream, is_0rtt))) => Ok((
                 SendStream::new(self.0.clone(), stream, is_0rtt),
                 RecvStream::new(self.0.clone(), stream, is_0rtt),
-            ))
-        } else {
-            Err(OpenStreamError::StreamsExhausted)
+            )),
+            Poll::Ready(Err(e)) => Err(e.into()),
+            Poll::Pending => Err(OpenStreamError::StreamsExhausted),
         }
     }
 
     /// Initiate a new outgoing bidirectional stream.
-    ///
-    /// Unlike [`open_bi()`], this method will wait for the connection to allow
-    /// a new stream to be opened.
-    ///
-    /// See [`open_bi()`] for details.
-    ///
-    /// [`open_bi()`]: Connection::open_bi
-    pub async fn open_bi_wait(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
+    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
         let (stream, is_0rtt) =
             future::poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Bi)).await?;
         Ok((
@@ -1188,7 +1448,7 @@ impl Connection {
             state.wake();
             Poll::Ready(Ok((stream, state.conn.is_handshaking())))
         } else {
-            state.stream_opened[dir as usize].push_back(cx.waker().clone());
+            push_waker_if_not_last(&mut state.stream_opened[dir as usize], cx.waker());
             Poll::Pending
         }
     }
@@ -1216,28 +1476,6 @@ impl Connection {
             SendStream::new(self.0.clone(), stream, is_0rtt),
             RecvStream::new(self.0.clone(), stream, is_0rtt),
         ))
-    }
-
-    /// Wait for the connection to be fully established.
-    ///
-    /// For clients, the resulting value indicates if 0-RTT was accepted. For
-    /// servers, the resulting value is meaningless.
-    pub async fn accepted_0rtt(&self) -> Result<bool, ConnectionError> {
-        future::poll_fn(|cx| {
-            let mut state = self.0.try_state()?;
-
-            if state.connected {
-                return Poll::Ready(Ok(state.conn.accepted_0rtt()));
-            }
-
-            match &state.on_connected {
-                Some(waker) if waker.will_wake(cx.waker()) => {}
-                _ => state.on_connected = Some(cx.waker().clone()),
-            }
-
-            Poll::Pending
-        })
-        .await
     }
 }
 

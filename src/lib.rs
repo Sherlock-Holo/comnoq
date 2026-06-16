@@ -6,43 +6,46 @@
 #![allow(unused_features)]
 #![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
-#![doc(
-    html_logo_url = "https://github.com/compio-rs/compio-logo/raw/refs/heads/master/generated/colored-bold.svg"
-)]
-#![doc(
-    html_favicon_url = "https://github.com/compio-rs/compio-logo/raw/refs/heads/master/generated/colored-bold.svg"
-)]
+
+use std::time::Duration;
 
 #[cfg(feature = "qlog")]
 pub use noq_proto::QlogConfig;
 pub use noq_proto::{
     AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosePathError, ClosedPath,
     ClosedStream, ConfigError, ConnectError, ConnectionClose, ConnectionId, ConnectionIdGenerator,
-    ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
-    MtuDiscoveryConfig, MultipathNotNegotiated, NoneTokenLog, NoneTokenStore, PathAbandonReason,
-    PathError, PathEvent, PathId, PathStats, PathStatus, ServerConfig, SetPathStatusError, Side,
-    StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore,
-    Transmit, TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
-    VarIntBoundsExceeded, Written, congestion, crypto, n0_nat_traversal,
+    ConnectionStats, DecryptedInitial, Dir, EcnCodepoint, EndpointConfig, FourTuple, FrameStats,
+    FrameType, IdleTimeout, MtuDiscoveryConfig, MultipathNotNegotiated, NetworkChangeHint,
+    NoneTokenLog, NoneTokenStore, PathAbandonReason, PathError, PathEvent, PathId, PathStats,
+    PathStatus, ServerConfig, SetPathStatusError, Side, StdSystemTime, StreamId, TimeSource,
+    TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit, TransportConfig,
+    TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt, VarIntBoundsExceeded, congestion,
+    crypto, n0_nat_traversal,
 };
 
 #[cfg(rustls)]
 mod builder;
 mod connection;
 mod endpoint;
+mod event_stream;
 mod incoming;
 mod path;
 mod recv_stream;
 mod send_stream;
 mod socket;
+mod work_limiter;
 
 #[cfg(rustls)]
 pub use builder::{ClientBuilder, ServerBuilder};
-pub use connection::{Connecting, Connection, ConnectionError, OpenStreamError, SendDatagramError};
-pub use endpoint::{Endpoint, EndpointStats};
+pub use connection::{
+    Closed, Connecting, Connection, ConnectionError, OnClosed, OpenStreamError, SendDatagramError,
+    WeakConnectionHandle, ZeroRttAccepted,
+};
+pub use endpoint::{Accept, Endpoint, EndpointStats};
+pub use event_stream::{Lagged, NatTraversalUpdates, ObservedExternalAddr, PathEvents};
 pub use incoming::{Incoming, IncomingFuture};
-pub use path::{AddressDiscovery, OpenPath, Path};
-pub use recv_stream::{ReadError, ReadExactError, RecvStream, ResetError};
+pub use path::{AddressDiscovery, OpenPath, Path, WeakPathHandle};
+pub use recv_stream::{ReadError, ReadExactError, RecvStream, ResetError, UnorderedRecvStream};
 pub use send_stream::{SendStream, StoppedError, WriteError};
 #[cfg(feature = "sync")]
 pub(crate) use synchrony::sync;
@@ -54,6 +57,12 @@ pub(crate) use crate::{
     endpoint::EndpointRef,
     socket::*,
 };
+
+/// Maximum number of datagrams/events processed before yielding to other work.
+const IO_LOOP_BOUND: usize = 160;
+
+/// Maximum time spent receiving UDP datagrams in a single endpoint cycle.
+const RECV_TIME_BOUND: Duration = Duration::from_micros(50);
 
 /// HTTP/3 support via [`h3`].
 #[cfg(feature = "h3")]

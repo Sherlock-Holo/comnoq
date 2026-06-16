@@ -2,11 +2,12 @@ use std::{
     future::{Future, IntoFuture},
     net::{IpAddr, SocketAddr},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use futures_util::FutureExt;
-use noq_proto::{ConnectionId, ServerConfig};
+use noq_proto::{ConnectionId, DecryptedInitial, ServerConfig};
 use thiserror::Error;
 
 use crate::{Connecting, Connection, ConnectionError, EndpointRef};
@@ -27,6 +28,12 @@ impl Incoming {
         Self(Some(IncomingInner { incoming, endpoint }))
     }
 
+    fn inner(&self) -> &IncomingInner {
+        self.0
+            .as_ref()
+            .expect("Incoming has already been consumed (accept/refuse/retry/ignore)")
+    }
+
     /// Attempt to accept this incoming connection (an error may still
     /// occur).
     pub fn accept(mut self) -> Result<Connecting, ConnectionError> {
@@ -41,7 +48,7 @@ impl Incoming {
     /// [`accept()`]: Incoming::accept
     pub fn accept_with(
         mut self,
-        server_config: ServerConfig,
+        server_config: Arc<ServerConfig>,
     ) -> Result<Connecting, ConnectionError> {
         let inner = self.0.take().unwrap();
         Ok(inner.endpoint.accept(inner.incoming, Some(server_config))?)
@@ -76,12 +83,12 @@ impl Incoming {
     /// The local IP address which was used when the peer established
     /// the connection.
     pub fn local_ip(&self) -> Option<IpAddr> {
-        self.0.as_ref().unwrap().incoming.local_ip()
+        self.inner().incoming.local_ip()
     }
 
     /// The peer's UDP address.
     pub fn remote_address(&self) -> SocketAddr {
-        self.0.as_ref().unwrap().incoming.remote_address()
+        self.inner().incoming.remote_address()
     }
 
     /// Whether the socket address that is initiating this connection has
@@ -90,7 +97,7 @@ impl Incoming {
     /// This means that the sender of the initial packet has proved that
     /// they can receive traffic sent to `self.remote_address()`.
     pub fn remote_address_validated(&self) -> bool {
-        self.0.as_ref().unwrap().incoming.remote_address_validated()
+        self.inner().incoming.remote_address_validated()
     }
 
     /// Whether it is legal to respond with a retry packet
@@ -98,12 +105,17 @@ impl Incoming {
     /// If `self.remote_address_validated()` is false, `self.may_retry()` is
     /// guaranteed to be true. The inverse is not guaranteed.
     pub fn may_retry(&self) -> bool {
-        self.0.as_ref().unwrap().incoming.may_retry()
+        self.inner().incoming.may_retry()
     }
 
     /// The original destination CID when initiating the connection
     pub fn orig_dst_cid(&self) -> ConnectionId {
-        self.0.as_ref().unwrap().incoming.orig_dst_cid()
+        self.inner().incoming.orig_dst_cid()
+    }
+
+    /// Decrypt the Initial packet payload.
+    pub fn decrypt(&self) -> Option<DecryptedInitial> {
+        self.inner().incoming.decrypt()
     }
 }
 
@@ -145,8 +157,8 @@ impl Future for IncomingFuture {
 }
 
 impl IntoFuture for Incoming {
-    type IntoFuture = IncomingFuture;
     type Output = Result<Connection, ConnectionError>;
+    type IntoFuture = IncomingFuture;
 
     fn into_future(self) -> Self::IntoFuture {
         IncomingFuture(self.accept())

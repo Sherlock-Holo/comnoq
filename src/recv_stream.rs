@@ -271,23 +271,24 @@ impl RecvStream {
             .map(|res| res.map(|n| n.unwrap_or_default()))
     }
 
-    /// Read the next segment of data.
+    /// Reads the next segment of data as zero-copy [`Bytes`].
     ///
-    /// Yields `None` if the stream was finished. Otherwise, yields a segment of
-    /// data and its offset in the stream. If `ordered` is `true`, the chunk's
-    /// offset will be immediately after the last data yielded by
-    /// [`read()`](Self::read) or [`read_chunk()`](Self::read_chunk). If
-    /// `ordered` is `false`, segments may be received in any order, and the
-    /// `Chunk`'s `offset` field can be used to determine ordering in the
-    /// caller. Unordered reads are less prone to head-of-line blocking within a
-    /// stream, but require the application to manage reassembling the original
-    /// data.
+    /// Yields `None` if the stream was finished. Otherwise, yields the next ordered segment of data.
+    /// Use [`bytes_read()`](Self::bytes_read) to query the segment offset explicitly.
+    /// For unordered reads, convert the stream with [`Self::into_unordered`].
     ///
     /// Slightly more efficient than `read` due to not copying. Chunk boundaries
     /// do not correspond to peer writes, and hence cannot be used as framing.
     ///
     /// This operation is cancel-safe.
-    pub async fn read_chunk(
+    pub async fn read_chunk(&mut self, max_length: usize) -> Result<Option<Bytes>, ReadError> {
+        Ok(self
+            .read_chunk_inner(max_length, true)
+            .await?
+            .map(|chunk| chunk.bytes))
+    }
+
+    async fn read_chunk_inner(
         &mut self,
         max_length: usize,
         ordered: bool,
@@ -304,14 +305,17 @@ impl RecvStream {
     /// Read the next segments of data.
     ///
     /// Fills `bufs` with the segments of data beginning immediately after the
-    /// last data yielded by `read` or `read_chunk`, or `None` if the stream was
+    /// last data yielded by `read`, `read_chunk`, or `read_many_chunks`, or `None` if the stream was
     /// finished.
     ///
     /// Slightly more efficient than `read` due to not copying. Chunk boundaries
     /// do not correspond to peer writes, and hence cannot be used as framing.
     ///
     /// This operation is cancel-safe.
-    pub async fn read_chunks(&mut self, bufs: &mut [Bytes]) -> Result<Option<usize>, ReadError> {
+    pub async fn read_many_chunks(
+        &mut self,
+        bufs: &mut [Bytes],
+    ) -> Result<Option<usize>, ReadError> {
         if bufs.is_empty() {
             return Ok(Some(0));
         }
@@ -340,6 +344,11 @@ impl RecvStream {
         .await
     }
 
+    /// Returns the number of bytes read from this stream.
+    pub fn bytes_read(&self) -> Result<u64, ClosedStream> {
+        self.conn.state().conn.recv_stream(self.stream).bytes_read()
+    }
+
     /// Convenience method to read all remaining data into a buffer.
     ///
     /// If unordered reads have already been made, the resulting buffer may have
@@ -351,7 +360,7 @@ impl RecvStream {
         let mut end = 0;
         let mut chunks = vec![];
         loop {
-            let chunk = match self.read_chunk(usize::MAX, false).await {
+            let chunk = match self.read_chunk_inner(usize::MAX, false).await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(e) => return BufResult(Err(e.into()), buf),
@@ -385,10 +394,48 @@ impl RecvStream {
         BufResult(Ok(len), buf)
     }
 
+    /// Converts this stream into an unordered stream.
+    pub fn into_unordered(self) -> UnorderedRecvStream {
+        UnorderedRecvStream { inner: self }
+    }
+
     /// Convert into an [`futures_util`] compatible stream.
     #[cfg(feature = "io-compat")]
     pub fn into_compat(self) -> CompatRecvStream {
         CompatRecvStream(self)
+    }
+}
+
+/// A stream that can be used to receive data out-of-order.
+#[derive(Debug)]
+pub struct UnorderedRecvStream {
+    inner: RecvStream,
+}
+
+impl UnorderedRecvStream {
+    /// Reads the next segment of data, with its stream offset.
+    pub async fn read_chunk(&mut self, max_length: usize) -> Result<Option<Chunk>, ReadError> {
+        self.inner.read_chunk_inner(max_length, false).await
+    }
+
+    /// Get the identity of this stream.
+    pub fn id(&self) -> StreamId {
+        self.inner.id()
+    }
+
+    /// Check if this stream has been opened during 0-RTT.
+    pub fn is_0rtt(&self) -> bool {
+        self.inner.is_0rtt()
+    }
+
+    /// Stop accepting data.
+    pub fn stop(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
+        self.inner.stop(error_code)
+    }
+
+    /// Completes when the stream has been reset by the peer or otherwise closed.
+    pub async fn received_reset(&mut self) -> Result<Option<VarInt>, ResetError> {
+        self.inner.received_reset().await
     }
 }
 

@@ -5,8 +5,8 @@ use std::{
 
 use compio::buf::{BufResult, IoBuf, bytes::Bytes};
 use compio::io::AsyncWrite;
-use futures_util::{future::poll_fn, ready};
-use noq_proto::{ClosedStream, FinishError, StreamId, VarInt, Written};
+use futures_util::future::poll_fn;
+use noq_proto::{ClosedStream, FinishError, StreamId, VarInt};
 use thiserror::Error;
 
 use crate::{ConnectionError, ConnectionInner, sync::shared::Shared};
@@ -178,34 +178,35 @@ impl SendStream {
         }
     }
 
-    /// Write chunks to the stream.
+    /// Writes [`Bytes`] from a slice of buffers into this stream.
     ///
-    /// Yields the number of bytes and chunks written on success.
-    /// Congestion and flow control may cause this to be shorter than
-    /// `buf.len()`, indicating that only a prefix of `bufs` was written.
+    /// On success, advances `bufs` past fully written chunks, splits a partially
+    /// written front chunk to its unwritten suffix, and returns the number of bytes written.
     ///
     /// This operation is cancel-safe.
-    pub async fn write_chunks(&mut self, bufs: &mut [Bytes]) -> Result<Written, WriteError> {
+    pub async fn write_many_chunks(
+        &mut self,
+        bufs: &mut &mut [Bytes],
+    ) -> Result<usize, WriteError> {
         poll_fn(|cx| self.execute_poll_write(cx, |mut stream| stream.write_chunks(bufs))).await
+    }
+
+    /// Writes a single [`Bytes`] into this stream in its entirety.
+    ///
+    /// This operation is *not* cancel-safe.
+    pub async fn write_chunk(&mut self, buf: Bytes) -> Result<(), WriteError> {
+        self.write_all_chunks(&mut [buf]).await
     }
 
     /// Convenience method to write an entire list of chunks to the stream.
     ///
     /// This operation is *not* cancel-safe.
     pub async fn write_all_chunks(&mut self, bufs: &mut [Bytes]) -> Result<(), WriteError> {
-        let mut chunks = 0;
-        poll_fn(|cx| {
-            loop {
-                if chunks == bufs.len() {
-                    return Poll::Ready(Ok(()));
-                }
-                let written = ready!(self.execute_poll_write(cx, |mut stream| {
-                    stream.write_chunks(&mut bufs[chunks..])
-                }))?;
-                chunks += written.chunks;
-            }
-        })
-        .await
+        let mut bufs = &mut bufs[..];
+        while !bufs.is_empty() {
+            self.write_many_chunks(&mut bufs).await?;
+        }
+        Ok(())
     }
 
     /// Convert this stream into a [`futures_util`] compatible stream.
@@ -357,6 +358,7 @@ mod compat {
     };
 
     use compio::buf::IntoInner;
+    use futures_util::ready;
 
     use super::*;
 
@@ -445,6 +447,7 @@ pub use compat::CompatSendStream;
 #[cfg(feature = "h3")]
 pub(crate) mod h3_impl {
     use compio::buf::bytes::Buf;
+    use futures_util::ready;
     use h3::quic::{self, StreamErrorIncoming, WriteBuf};
 
     use super::*;
@@ -535,11 +538,9 @@ pub(crate) mod h3_impl {
             cx: &mut Context<'_>,
             buf: &mut D,
         ) -> Poll<Result<usize, StreamErrorIncoming>> {
-            // This signifies a bug in implementation
-            debug_assert!(
-                self.buf.is_some(),
-                "poll_send called while send stream is not ready"
-            );
+            if self.buf.is_none() {
+                return Poll::Ready(Err(WriteError::NotReady.into()));
+            }
 
             let n = ready!(
                 self.inner

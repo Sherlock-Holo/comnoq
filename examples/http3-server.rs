@@ -22,7 +22,7 @@ async fn main() {
         .await
         .unwrap();
 
-    while let Some(incoming) = endpoint.wait_incoming().await {
+    while let Some(incoming) = endpoint.accept().await {
         compio::runtime::spawn(async move {
             let conn = incoming.await.unwrap();
             println!("Accepted connection from {}", conn.remote_address());
