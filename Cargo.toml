@@ -5,6 +5,7 @@ description = "QUIC for compio with noq backend"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "net", "quic"]
 readme = "README.md"
+repository = "https://github.com/Sherlock-Holo/comnoq"
 license = "MIT"
 edition = "2024"
 
