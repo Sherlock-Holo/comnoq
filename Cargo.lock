@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "comnoq"
-version = "0.3.0-rc.0"
+version = "0.3.0"
 dependencies = [
  "async-broadcast",
  "cfg_aliases",
@@ -1122,6 +1122,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "humantime"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
+
+[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1385,14 +1391,14 @@ checksum = "21909324aa58f5c284d91cac514c6d081210901dc372d7c8ea6a9d7e0406097a"
 
 [[package]]
 name = "n0-qlog"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04fd2af7d4c68cd5c31fa69e64644e0a778bd1656bb8dfb86f9852f7d02a112e"
+checksum = "bb1c2fc610d1facce51b0bf5d8245b309c91996a933defdf7742c92ac78a58cb"
 dependencies = [
+ "humantime",
  "serde",
  "serde_json",
  "serde_with",
- "smallvec",
  "strum",
 ]
 
@@ -1408,9 +1414,9 @@ dependencies = [
 
 [[package]]
 name = "noq"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "198b99fc085a5db1f7d259edb5ede8311e59f28cdd2687920b4313613d21a73f"
+checksum = "11f0c73794bfde94db01379c46990b9a773993fca2b61a66184ce148b7c7a187"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -1430,9 +1436,9 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ab0ac774795ce1e42a7e61266e71f3be8110210630441169ac8dda403dd23f1"
+checksum = "775be06b8d66c2c64db60140bf54dee8410f67b73c81cc1e1e32f11dfdaae501"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -1460,9 +1466,9 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.0.0-rc.1"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3c1520eacd33fd6b009e2e70116b05508ade51db5e0d315ff8bf6b702148c2b"
+checksum = "cd5a37756f168cf350d68a97c4f0158bdf3c76f10175123941569b09ab51f011"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -2234,9 +2240,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "socket2"
