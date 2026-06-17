@@ -97,3 +97,13 @@ required-features = ["sync"]
 name = "quic"
 harness = false
 required-features = ["io-compat"]
+
+[patch.crates-io]
+compio = { git = "https://github.com/Sherlock-Holo/compio.git", branch = "multi-buffer-pool" }
+compio-buf = { git = "https://github.com/Sherlock-Holo/compio.git", branch = "multi-buffer-pool" }
+compio-driver = { git = "https://github.com/Sherlock-Holo/compio.git", branch = "multi-buffer-pool" }
+compio-runtime = { git = "https://github.com/Sherlock-Holo/compio.git", branch = "multi-buffer-pool" }
+compio-net = { git = "https://github.com/Sherlock-Holo/compio.git", branch = "multi-buffer-pool" }
+compio-io = { git = "https://github.com/Sherlock-Holo/compio.git", branch = "multi-buffer-pool" }
+compio-macros = { git = "https://github.com/Sherlock-Holo/compio.git", branch = "multi-buffer-pool" }
+compio-executor = { git = "https://github.com/Sherlock-Holo/compio.git", branch = "multi-buffer-pool" }

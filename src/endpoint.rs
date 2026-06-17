@@ -5,21 +5,21 @@ use std::{
     mem::ManuallyDrop,
     net::{SocketAddr, SocketAddrV6},
     ops::Deref,
-    pin::{Pin, pin},
+    pin::Pin,
     ptr,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll, Waker},
     time::Instant,
 };
 
-use compio::buf::{BufResult, bytes::Bytes};
+use compio::buf::bytes::Bytes;
 #[cfg(rustls)]
 use compio::net::ToSocketAddrsAsync;
 use compio::net::UdpSocket;
 use compio::runtime::JoinHandle;
 use compio_log::{Instrument, error};
 use flume::{Receiver, Sender, unbounded};
-use futures_util::{FutureExt, StreamExt, future::FusedFuture, select, task::AtomicWaker};
+use futures_util::{StreamExt, select, task::AtomicWaker};
 use noq_proto::{
     ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointConfig,
     EndpointEvent, FourTuple, NetworkChangeHint, ServerConfig, Transmit, VarInt,
@@ -27,8 +27,8 @@ use noq_proto::{
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
-    Connecting, ConnectionEvent, IO_LOOP_BOUND, Incoming, RecvMeta, SharedSocketState, Socket,
-    SocketEntry, SocketSet, select_socket, spawn_recv_task,
+    Connecting, ConnectionEvent, EndpointRecvPool, IO_LOOP_BOUND, Incoming, RecvMeta,
+    SharedSocketState, Socket, SocketEntry, SocketSet, select_socket, spawn_recv_task,
     sync::{atomic::AtomicBool, mutex_blocking::Mutex, shared::Shared},
 };
 
@@ -203,9 +203,10 @@ impl EndpointInner {
         let ipv6 = socket.local_addr()?.is_ipv6();
         let allow_mtud = !socket.may_fragment();
 
-        let (recv_tx, recv_rx) = unbounded();
         let endpoint_config = Arc::new(config);
         let max_payload_size = endpoint_config.get_max_udp_payload_size().min(64 * 1024) as usize;
+        let recv_pool = EndpointRecvPool::new(max_payload_size, socket.max_gro_segments())?;
+        let (recv_tx, recv_rx) = unbounded();
 
         Ok(Self {
             state: Mutex::new(EndpointState {
@@ -233,7 +234,7 @@ impl EndpointInner {
                 prev_sockets: Vec::new(),
                 recv_tx,
                 stopped: Arc::new(AtomicBool::new(false)),
-                max_payload_size,
+                recv_pool,
             })),
             recv_rx,
             ipv6: AtomicBool::new(ipv6),
@@ -333,61 +334,39 @@ impl EndpointInner {
         state.endpoint.ignore(incoming);
     }
 
-    fn recv_on(
-        socket: Socket,
-        buffer: Vec<u8>,
-    ) -> impl FusedFuture<Output = (Socket, BufResult<RecvMeta, Vec<u8>>)> {
-        async move {
-            let result = socket.recv(buffer).await;
-            (socket, result)
-        }
-        .fuse()
-    }
-
     async fn run(&self) -> io::Result<()> {
         let respond_fn = |buf: Vec<u8>, transmit: Transmit| self.respond(buf, transmit);
 
-        let max_payload = self
-            .state
-            .lock()
-            .endpoint
-            .config()
-            .get_max_udp_payload_size()
-            .min(64 * 1024) as usize;
-
-        let primary_socket = {
+        let (primary_socket, recv_pool) = {
             let sockets = self.sockets.lock().unwrap();
             for entry in sockets.sockets.iter().skip(1) {
-                spawn_recv_task(&self.sockets, &entry.socket, max_payload);
+                spawn_recv_task(&self.sockets, &entry.socket);
             }
-            sockets.sockets[0].socket.clone()
+            (sockets.sockets[0].socket.clone(), sockets.recv_pool.clone())
         };
 
-        let recv_buf = Vec::with_capacity(max_payload * primary_socket.max_gro_segments());
-        let mut recv_fut = pin!(Self::recv_on(primary_socket, recv_buf));
+        let mut primary_recv_stream = primary_socket.recv_multi(&recv_pool).fuse();
         let mut recv_stream = self.recv_rx.stream().ready_chunks(IO_LOOP_BOUND);
         let mut event_stream = self.events.1.stream().ready_chunks(IO_LOOP_BOUND);
         let mut rebind_stream = self.rebind.1.stream();
 
         loop {
             let mut state = select! {
-                (socket, BufResult(res, recv_buf)) = recv_fut => {
+                result = primary_recv_stream.select_next_some() => {
                     let mut state = self.state.lock();
-                    match res {
-                        Ok(meta) => {
-                            state.handle_data(meta, &recv_buf, respond_fn);
+                    match result {
+                        Ok((meta, buf)) => {
+                            state.handle_data(meta, buf.as_ref(), respond_fn);
                         }
                         Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
                         #[cfg(windows)]
                         Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PORT_UNREACHABLE as _) => {}
                         Err(e) => break Err(e),
                     }
-                    recv_fut.set(Self::recv_on(socket, recv_buf));
                     state
                 },
                 socket = rebind_stream.select_next_some() => {
-                    let recv_buf = Vec::with_capacity(max_payload * socket.max_gro_segments());
-                    recv_fut.set(Self::recv_on(socket, recv_buf));
+                    primary_recv_stream = socket.recv_multi(&recv_pool).fuse();
                     self.state.lock()
                 },
                 items = recv_stream.select_next_some() => {

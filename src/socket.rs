@@ -3,7 +3,7 @@
 //!
 //! Differences from [`quinn-udp`]:
 //! - [quinn-rs/quinn#1516] is not implemented
-//! - `recvmmsg` is not available
+//! - batch receiving is implemented with compio's multishot `RecvMsgMulti`
 //!
 //! [`quinn-udp`]: https://docs.rs/quinn-udp
 //! [quinn-rs/quinn#1516]: https://github.com/quinn-rs/quinn/pull/1516
@@ -17,10 +17,16 @@ use std::{
     sync::{Arc, Mutex, atomic::Ordering},
 };
 
-use compio::buf::{BufResult, IntoInner, IoBuf, IoBufMut, SetLen, buf_try};
+use compio::buf::{BufResult, IntoInner, IoBuf, IoBufMut, SetLen};
+use compio::driver::{
+    BoxAllocator, BufferPool, BufferRef, ToSharedFd,
+    op::{RecvFlags, RecvMsgMulti, RecvMsgMultiResult, ReturnFlags},
+};
 use compio::io::ancillary::{AncillaryBuilder, AncillaryData, AncillaryIter};
 use compio::net::UdpSocket;
+use compio::runtime::{Runtime, SubmitMultiStream};
 use flume::Sender;
+use futures_util::{Stream, StreamExt};
 use noq_proto::{EcnCodepoint, Transmit};
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock;
@@ -28,6 +34,7 @@ use windows_sys::Win32::Networking::WinSock;
 use crate::sync::atomic::AtomicBool;
 
 const CMSG_LEN: usize = 128;
+const RECV_POOL_SIZE: u16 = 16;
 
 #[repr(align(16))]
 struct AlignedControlBytes([u8; CMSG_LEN]);
@@ -104,6 +111,113 @@ pub(crate) struct RecvMeta {
     /// Populated on platforms: Windows, Linux, Android, FreeBSD, OpenBSD,
     /// NetBSD, macOS, and iOS.
     pub local_ip: Option<IpAddr>,
+}
+
+impl RecvMeta {
+    fn from_parts(remote: SocketAddr, len: usize, ancillary: &[u8]) -> Self {
+        let (ecn_bits, local_ip, stride) = Self::ancillary_fields(ancillary, len);
+        Self {
+            remote,
+            len,
+            stride,
+            ecn: EcnCodepoint::from_bits(ecn_bits),
+            local_ip,
+        }
+    }
+
+    fn ancillary_fields(control: &[u8], len: usize) -> (u8, Option<IpAddr>, usize) {
+        let mut ecn_bits = 0u8;
+        let mut local_ip = None;
+        #[allow(unused_mut)]
+        let mut stride = len;
+
+        if !control.is_empty() {
+            // SAFETY: `control` is initialized by recvmsg and contains valid control messages
+            // returned by the OS.
+            for cmsg in unsafe { AncillaryIter::new(control) } {
+                #[cfg(windows)]
+                const UDP_COALESCED_INFO: i32 = WinSock::UDP_COALESCED_INFO as i32;
+
+                match (cmsg.level(), cmsg.ty()) {
+                    // ECN
+                    #[cfg(unix)]
+                    (libc::IPPROTO_IP, libc::IP_TOS) => {
+                        ecn_bits = cmsg.data::<u8>().expect("valid IP_TOS cmsg")
+                    }
+                    #[cfg(all(unix, not(any(non_freebsd, solarish))))]
+                    (libc::IPPROTO_IP, libc::IP_RECVTOS) => {
+                        ecn_bits = cmsg.data::<u8>().expect("valid IP_RECVTOS cmsg")
+                    }
+                    #[cfg(unix)]
+                    (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => {
+                        // NOTE: It's OK to use `c_int` instead of `u8` on Apple systems
+                        ecn_bits = cmsg.data::<libc::c_int>().expect("valid IPV6_TCLASS cmsg") as u8
+                    }
+                    #[cfg(windows)]
+                    (WinSock::IPPROTO_IP, WinSock::IP_ECN)
+                    | (WinSock::IPPROTO_IPV6, WinSock::IPV6_ECN) => {
+                        ecn_bits = cmsg.data::<i32>().expect("valid IP_ECN cmsg") as u8
+                    }
+
+                    // pktinfo / destination address
+                    #[cfg(linux_all)]
+                    (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
+                        let pktinfo = cmsg
+                            .data::<libc::in_pktinfo>()
+                            .expect("valid IP_PKTINFO cmsg");
+                        local_ip = Some(IpAddr::from(pktinfo.ipi_addr.s_addr.to_ne_bytes()));
+                    }
+                    #[cfg(any(bsd, solarish, apple))]
+                    (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) => {
+                        let in_addr = cmsg
+                            .data::<libc::in_addr>()
+                            .expect("valid IP_RECVDSTADDR cmsg");
+                        local_ip = Some(IpAddr::from(in_addr.s_addr.to_ne_bytes()));
+                    }
+                    #[cfg(windows)]
+                    (WinSock::IPPROTO_IP, WinSock::IP_PKTINFO) => {
+                        let pktinfo = cmsg
+                            .data::<WinSock::IN_PKTINFO>()
+                            .expect("valid IP_PKTINFO cmsg");
+                        local_ip = Some(IpAddr::from(
+                            // SAFETY: S_addr is a valid representation of the union for IPv4
+                            // addresses
+                            unsafe { pktinfo.ipi_addr.S_un.S_addr }.to_ne_bytes(),
+                        ));
+                    }
+                    #[cfg(unix)]
+                    (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
+                        let pktinfo = cmsg
+                            .data::<libc::in6_pktinfo>()
+                            .expect("valid IPV6_PKTINFO cmsg");
+                        local_ip = Some(IpAddr::from(pktinfo.ipi6_addr.s6_addr));
+                    }
+                    #[cfg(windows)]
+                    (WinSock::IPPROTO_IPV6, WinSock::IPV6_PKTINFO) => {
+                        let pktinfo = cmsg
+                            .data::<WinSock::IN6_PKTINFO>()
+                            .expect("valid IPV6_PKTINFO cmsg");
+                        // SAFETY: Byte is a valid representation of the union for IPv6 addresses
+                        local_ip = Some(IpAddr::from(unsafe { pktinfo.ipi6_addr.u.Byte }));
+                    }
+
+                    // GRO
+                    #[cfg(linux_all)]
+                    (libc::SOL_UDP, libc::UDP_GRO) => {
+                        stride = cmsg.data::<libc::c_int>().expect("valid UDP_GRO cmsg") as usize
+                    }
+                    #[cfg(windows)]
+                    (WinSock::IPPROTO_UDP, UDP_COALESCED_INFO) => {
+                        stride = cmsg.data::<u32>().expect("valid UDP_COALESCED_INFO cmsg") as usize
+                    }
+
+                    _ => {}
+                }
+            }
+        }
+
+        (ecn_bits, local_ip, stride)
+    }
 }
 
 fn push_cmsg<T: AncillaryData>(
@@ -340,110 +454,21 @@ impl Socket {
         }
     }
 
-    pub async fn recv<T: IoBufMut>(&self, buffer: T) -> BufResult<RecvMeta, T> {
-        let control = ControlBuf::new();
+    pub fn recv_multi(
+        &self,
+        pool: &EndpointRecvPool,
+    ) -> impl Stream<Item = io::Result<(RecvMeta, RecvBuffer)>> + use<> {
+        let fd = self.inner.to_shared_fd();
+        let rt = Runtime::current();
+        let buffer_pool = pool.pool.clone();
 
-        let BufResult(res, (buffer, control)) = self.inner.recv_msg(buffer, control).await;
-        let ((len, control_len, remote, _flags), buffer) = buf_try!(res, buffer);
-
-        let mut ecn_bits = 0u8;
-        let mut local_ip = None;
-        #[allow(unused_mut)]
-        let mut stride = len;
-
-        if control_len > 0 {
-            // SAFETY: `control[..control_len]` is initialized by `recv_msg` and contains
-            // valid control messages returned by the OS.
-            for cmsg in unsafe { AncillaryIter::new(&control.as_init()[..control_len]) } {
-                #[cfg(windows)]
-                const UDP_COALESCED_INFO: i32 = WinSock::UDP_COALESCED_INFO as i32;
-
-                match (cmsg.level(), cmsg.ty()) {
-                    // ECN
-                    #[cfg(unix)]
-                    (libc::IPPROTO_IP, libc::IP_TOS) => {
-                        ecn_bits = cmsg.data::<u8>().expect("valid IP_TOS cmsg")
-                    }
-                    #[cfg(all(unix, not(any(non_freebsd, solarish))))]
-                    (libc::IPPROTO_IP, libc::IP_RECVTOS) => {
-                        ecn_bits = cmsg.data::<u8>().expect("valid IP_RECVTOS cmsg")
-                    }
-                    #[cfg(unix)]
-                    (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => {
-                        // NOTE: It's OK to use `c_int` instead of `u8` on Apple systems
-                        ecn_bits = cmsg.data::<libc::c_int>().expect("valid IPV6_TCLASS cmsg") as u8
-                    }
-                    #[cfg(windows)]
-                    (WinSock::IPPROTO_IP, WinSock::IP_ECN)
-                    | (WinSock::IPPROTO_IPV6, WinSock::IPV6_ECN) => {
-                        ecn_bits = cmsg.data::<i32>().expect("valid IP_ECN cmsg") as u8
-                    }
-
-                    // pktinfo / destination address
-                    #[cfg(linux_all)]
-                    (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
-                        let pktinfo = cmsg
-                            .data::<libc::in_pktinfo>()
-                            .expect("valid IP_PKTINFO cmsg");
-                        local_ip = Some(IpAddr::from(pktinfo.ipi_addr.s_addr.to_ne_bytes()));
-                    }
-                    #[cfg(any(bsd, solarish, apple))]
-                    (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) => {
-                        let in_addr = cmsg
-                            .data::<libc::in_addr>()
-                            .expect("valid IP_RECVDSTADDR cmsg");
-                        local_ip = Some(IpAddr::from(in_addr.s_addr.to_ne_bytes()));
-                    }
-                    #[cfg(windows)]
-                    (WinSock::IPPROTO_IP, WinSock::IP_PKTINFO) => {
-                        let pktinfo = cmsg
-                            .data::<WinSock::IN_PKTINFO>()
-                            .expect("valid IP_PKTINFO cmsg");
-                        local_ip = Some(IpAddr::from(
-                            // SAFETY: S_addr is a valid representation of the union for IPv4
-                            // addresses
-                            unsafe { pktinfo.ipi_addr.S_un.S_addr }.to_ne_bytes(),
-                        ));
-                    }
-                    #[cfg(unix)]
-                    (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
-                        let pktinfo = cmsg
-                            .data::<libc::in6_pktinfo>()
-                            .expect("valid IPV6_PKTINFO cmsg");
-                        local_ip = Some(IpAddr::from(pktinfo.ipi6_addr.s6_addr));
-                    }
-                    #[cfg(windows)]
-                    (WinSock::IPPROTO_IPV6, WinSock::IPV6_PKTINFO) => {
-                        let pktinfo = cmsg
-                            .data::<WinSock::IN6_PKTINFO>()
-                            .expect("valid IPV6_PKTINFO cmsg");
-                        // SAFETY: Byte is a valid representation of the union for IPv6 addresses
-                        local_ip = Some(IpAddr::from(unsafe { pktinfo.ipi6_addr.u.Byte }));
-                    }
-
-                    // GRO
-                    #[cfg(linux_all)]
-                    (libc::SOL_UDP, libc::UDP_GRO) => {
-                        stride = cmsg.data::<libc::c_int>().expect("valid UDP_GRO cmsg") as usize
-                    }
-                    #[cfg(windows)]
-                    (WinSock::IPPROTO_UDP, UDP_COALESCED_INFO) => {
-                        stride = cmsg.data::<u32>().expect("valid UDP_COALESCED_INFO cmsg") as usize
-                    }
-
-                    _ => {}
-                }
-            }
-        }
-
-        let meta = RecvMeta {
-            remote,
-            len,
-            stride,
-            ecn: EcnCodepoint::from_bits(ecn_bits),
-            local_ip,
-        };
-        BufResult(Ok(meta), buffer)
+        SubmitMultiStream::new(move || {
+            let op = RecvMsgMulti::new(fd.clone(), &buffer_pool, CMSG_LEN, RecvFlags::empty())?;
+            Ok(rt
+                .submit_multi(op)
+                .into_managed_with(buffer_pool.clone(), CMSG_LEN))
+        })
+        .map(|res| res.and_then(RecvBuffer::from_multi))
     }
 
     fn construct_control_message(&self, transmit: &Transmit) -> io::Result<ControlBuf> {
@@ -657,6 +682,79 @@ pub(crate) struct SocketEntry {
     pub local_ip: Option<IpAddr>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EndpointRecvPool {
+    pool: BufferPool,
+}
+
+impl EndpointRecvPool {
+    pub(crate) fn new(max_payload: usize, max_gro_segments: usize) -> io::Result<Self> {
+        let buffer_len = match max_payload.checked_mul(max_gro_segments) {
+            Some(len) if len > 0 => len.min(64 * 1024),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "recv pool buffer length must be positive",
+                ));
+            }
+        };
+        let pool =
+            compio::runtime::create_buffer_pool::<BoxAllocator>(RECV_POOL_SIZE, buffer_len, 0)?;
+
+        Ok(Self { pool })
+    }
+}
+
+pub(crate) struct RecvBuffer {
+    buffer: BufferRef,
+    offset: usize,
+    len: usize,
+}
+
+impl RecvBuffer {
+    fn from_multi(msg: RecvMsgMultiResult) -> io::Result<(RecvMeta, Self)> {
+        let data = msg.data();
+        let len = data.len();
+        let data_ptr = data.as_ptr() as usize;
+        let remote = msg
+            .addr()
+            .and_then(|addr| addr.as_socket())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing remote address"))?;
+
+        if msg.flags().contains(ReturnFlags::TRUNC) {
+            compio_log::warn!("received truncated UDP datagram");
+        }
+
+        let meta = RecvMeta::from_parts(remote, len, msg.ancillary());
+        let buffer = msg.into_inner();
+        let buffer_ptr = buffer.as_init().as_ptr() as usize;
+        let offset = data_ptr
+            .checked_sub(buffer_ptr)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid payload offset"))?;
+        if offset + len > buffer.as_init().len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload exceeds receive buffer",
+            ));
+        }
+        Ok((
+            meta,
+            Self {
+                buffer,
+                offset,
+                len,
+            },
+        ))
+    }
+}
+
+impl AsRef<[u8]> for RecvBuffer {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer.as_init()[self.offset..self.offset + self.len]
+    }
+}
+
 pub(crate) type RecvItem = (RecvMeta, Vec<u8>);
 
 pub(crate) struct SharedSocketState {
@@ -664,7 +762,7 @@ pub(crate) struct SharedSocketState {
     pub prev_sockets: Vec<Socket>,
     pub recv_tx: Sender<RecvItem>,
     pub stopped: Arc<AtomicBool>,
-    pub max_payload_size: usize,
+    pub recv_pool: EndpointRecvPool,
 }
 
 pub(crate) type SocketSet = Arc<Mutex<SharedSocketState>>;
@@ -685,33 +783,35 @@ pub(crate) fn select_socket(sockets: &SocketSet, src_ip: Option<IpAddr>) -> Sock
         .clone()
 }
 
-pub(crate) fn spawn_recv_task(sockets: &SocketSet, socket: &Socket, max_payload: usize) {
+pub(crate) fn spawn_recv_task(sockets: &SocketSet, socket: &Socket) {
     let socket = socket.clone();
     let recv_tx;
     let stopped;
+    let recv_pool;
     {
         let shared = sockets.lock().unwrap();
         recv_tx = shared.recv_tx.clone();
         stopped = shared.stopped.clone();
+        recv_pool = shared.recv_pool.clone();
     }
-    let max_gro = socket.max_gro_segments();
 
     compio::runtime::spawn(async move {
+        let mut recv_stream = socket.recv_multi(&recv_pool);
         loop {
             if stopped.load(Ordering::Relaxed) {
                 break;
             }
-            // TODO: performance: consider buffer pool to reused buf
-            let buf = Vec::with_capacity(max_payload * max_gro);
-            let BufResult(res, buf) = socket.recv(buf).await;
-            match res {
-                Ok(meta) => {
-                    recv_tx.send_async((meta, buf)).await.ok();
+            match recv_stream.next().await {
+                Some(Ok((meta, buf))) => {
+                    recv_tx.send_async((meta, buf.as_ref().to_vec())).await.ok();
                 }
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
-                Err(_e) => {
+                Some(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                Some(Err(_e)) => {
                     compio_log::error!("socket recv error: {_e:?}");
                     break;
+                }
+                None => {
+                    recv_stream = socket.recv_multi(&recv_pool);
                 }
             }
         }
@@ -727,9 +827,14 @@ mod tests {
     #[cfg(windows)]
     use std::os::windows::io::AsRawSocket;
 
+    use futures_util::StreamExt;
     use socket2::{Domain, Protocol, Socket as Socket2, Type};
 
     use super::*;
+
+    fn test_recv_pool(passive: &Socket) -> EndpointRecvPool {
+        EndpointRecvPool::new(u16::MAX as usize, passive.max_gro_segments()).unwrap()
+    }
 
     async fn test_send_recv<T: IoBuf>(
         passive: Socket,
@@ -739,6 +844,8 @@ mod tests {
     ) {
         let passive_addr = passive.local_addr().unwrap();
         let active_addr = active.local_addr().unwrap();
+        let recv_pool = test_recv_pool(&passive);
+        let mut recv_stream = passive.recv_multi(&recv_pool);
 
         let content = active.send(content, &transmit).await;
 
@@ -746,16 +853,13 @@ mod tests {
         let expected_datagrams = transmit.size / segment_size;
         let mut datagrams = 0;
         while datagrams < expected_datagrams {
-            let (meta, buf) = passive
-                .recv(Vec::with_capacity(u16::MAX as usize))
-                .await
-                .unwrap();
+            let (meta, buf) = recv_stream.next().await.unwrap().unwrap();
             let segments = meta.len / meta.stride;
             for i in 0..segments {
                 assert_eq!(
                     &content.as_init()
                         [(datagrams + i) * segment_size..(datagrams + i + 1) * segment_size],
-                    &buf[(i * meta.stride)..((i + 1) * meta.stride)]
+                    &buf.as_ref()[(i * meta.stride)..((i + 1) * meta.stride)]
                 );
             }
             datagrams += segments;
@@ -790,7 +894,7 @@ mod tests {
         socket.set_only_v6(false)?;
         socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).into())?;
 
-        compio::runtime::Runtime::with_current(|r| r.attach(socket.as_raw_fd()))?;
+        Runtime::with_current(|r| r.attach(socket.as_raw_fd()))?;
         #[cfg(unix)]
         unsafe {
             Ok(UdpSocket::from_raw_fd(socket.into_raw_fd()))
@@ -814,6 +918,39 @@ mod tests {
             src_ip: None,
         };
         test_send_recv(passive, active, content, transmit).await;
+    }
+
+    #[compio::test]
+    async fn recv_multi_burst() {
+        const PACKETS: usize = 8;
+
+        let passive = Socket::new(UdpSocket::bind("[::1]:0").await.unwrap()).unwrap();
+        let active = Socket::new(UdpSocket::bind("[::1]:0").await.unwrap()).unwrap();
+        let recv_pool = test_recv_pool(&passive);
+        let mut recv_stream = passive.recv_multi(&recv_pool);
+        let passive_addr = passive.local_addr().unwrap();
+
+        for i in 0..PACKETS {
+            let content = vec![i as u8; 16];
+            let transmit = Transmit {
+                destination: passive_addr,
+                ecn: None,
+                size: content.len(),
+                segment_size: None,
+                src_ip: None,
+            };
+            active.send(content, &transmit).await;
+        }
+
+        let mut received = Vec::new();
+        for _ in 0..PACKETS {
+            let (_meta, buf) = recv_stream.next().await.unwrap().unwrap();
+            received.push(buf.as_ref().to_vec());
+        }
+        received.sort();
+
+        let expected = (0..PACKETS).map(|i| vec![i as u8; 16]).collect::<Vec<_>>();
+        assert_eq!(received, expected);
     }
 
     #[compio::test]

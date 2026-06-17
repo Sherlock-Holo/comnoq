@@ -1170,7 +1170,6 @@ impl Connection {
             ip => Some(ip),
         };
 
-        let max_payload = self.0.sockets.lock().unwrap().max_payload_size;
         {
             let mut shared = self.0.sockets.lock().unwrap();
             shared.sockets.push(SocketEntry {
@@ -1178,7 +1177,7 @@ impl Connection {
                 local_ip,
             });
         }
-        spawn_recv_task(&self.0.sockets, &socket, max_payload);
+        spawn_recv_task(&self.0.sockets, &socket);
 
         let tx = Broadcast::new(1);
         let rx = tx.subscribe();
