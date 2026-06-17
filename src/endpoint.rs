@@ -337,7 +337,7 @@ impl EndpointInner {
     async fn run(&self) -> io::Result<()> {
         let respond_fn = |buf: Vec<u8>, transmit: Transmit| self.respond(buf, transmit);
 
-        let (mut primary_socket, recv_pool) = {
+        let (primary_socket, recv_pool) = {
             let sockets = self.sockets.lock().unwrap();
             for entry in sockets.sockets.iter().skip(1) {
                 spawn_recv_task(&self.sockets, &entry.socket);
@@ -352,25 +352,21 @@ impl EndpointInner {
 
         loop {
             let mut state = select! {
-                result = primary_recv_stream.next() => {
+                result = primary_recv_stream.select_next_some() => {
                     let mut state = self.state.lock();
                     match result {
-                        Some(Ok((meta, buf))) => {
+                        Ok((meta, buf)) => {
                             state.handle_data(meta, buf.as_ref(), respond_fn);
                         }
-                        Some(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
                         #[cfg(windows)]
-                        Some(Err(e)) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PORT_UNREACHABLE as _) => {}
-                        Some(Err(e)) => break Err(e),
-                        None => {
-                            primary_recv_stream = primary_socket.recv_multi(&recv_pool).fuse();
-                        }
+                        Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_PORT_UNREACHABLE as _) => {}
+                        Err(e) => break Err(e),
                     }
                     state
                 },
                 socket = rebind_stream.select_next_some() => {
                     primary_recv_stream = socket.recv_multi(&recv_pool).fuse();
-                    primary_socket = socket;
                     self.state.lock()
                 },
                 items = recv_stream.select_next_some() => {

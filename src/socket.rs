@@ -8,13 +8,16 @@
 //! [`quinn-udp`]: https://docs.rs/quinn-udp
 //! [quinn-rs/quinn#1516]: https://github.com/quinn-rs/quinn/pull/1516
 
+use std::mem::ManuallyDrop;
 use std::{
     future::Future,
     io,
     mem::MaybeUninit,
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
+    pin::Pin,
     sync::{Arc, Mutex, atomic::Ordering},
+    task::{Context, Poll, ready},
 };
 
 use compio::buf::{BufResult, IntoInner, IoBuf, IoBufMut, SetLen};
@@ -24,7 +27,9 @@ use compio::driver::{
 };
 use compio::io::ancillary::{AncillaryBuilder, AncillaryData, AncillaryIter};
 use compio::net::UdpSocket;
+use compio::runtime;
 use compio::runtime::{Runtime, SubmitMultiStream};
+use event_listener::{Event, EventListener};
 use flume::Sender;
 use futures_util::{Stream, StreamExt};
 use noq_proto::{EcnCodepoint, Transmit};
@@ -34,7 +39,7 @@ use windows_sys::Win32::Networking::WinSock;
 use crate::sync::atomic::AtomicBool;
 
 const CMSG_LEN: usize = 128;
-const RECV_POOL_SIZE: u16 = 16;
+const RECV_POOL_SIZE: u16 = 64;
 
 #[repr(align(16))]
 struct AlignedControlBytes([u8; CMSG_LEN]);
@@ -454,21 +459,26 @@ impl Socket {
         }
     }
 
-    pub fn recv_multi(
-        &self,
-        pool: &EndpointRecvPool,
-    ) -> impl Stream<Item = io::Result<(RecvMeta, RecvBuffer)>> + use<> {
+    pub fn recv_multi(&self, pool: &EndpointRecvPool) -> RecvMultiStream {
         let fd = self.inner.to_shared_fd();
-        let rt = Runtime::current();
-        let buffer_pool = pool.pool.clone();
+        let ep_pool = pool.clone();
 
-        SubmitMultiStream::new(move || {
-            let op = RecvMsgMulti::new(fd.clone(), &buffer_pool, CMSG_LEN, RecvFlags::empty())?;
-            Ok(rt
-                .submit_multi(op)
-                .into_managed_with(buffer_pool.clone(), CMSG_LEN))
-        })
-        .map(|res| res.and_then(RecvBuffer::from_multi))
+        RecvMultiStream::new(
+            ep_pool.clone(),
+            Box::new(move || {
+                let buffer_pool = ep_pool.pool.clone();
+                let fd = fd.clone();
+
+                Ok(Box::pin(SubmitMultiStream::new(move || {
+                    let op =
+                        RecvMsgMulti::new(fd.clone(), &buffer_pool, CMSG_LEN, RecvFlags::empty())?;
+
+                    Ok(Runtime::current()
+                        .submit_multi(op)
+                        .into_managed_with(buffer_pool.clone(), CMSG_LEN))
+                })))
+            }),
+        )
     }
 
     fn construct_control_message(&self, transmit: &Transmit) -> io::Result<ControlBuf> {
@@ -685,10 +695,19 @@ pub(crate) struct SocketEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct EndpointRecvPool {
     pool: BufferPool,
+    returned: Arc<Event>,
 }
 
 impl EndpointRecvPool {
     pub(crate) fn new(max_payload: usize, max_gro_segments: usize) -> io::Result<Self> {
+        Self::with_pool_size(max_payload, max_gro_segments, RECV_POOL_SIZE)
+    }
+
+    fn with_pool_size(
+        max_payload: usize,
+        max_gro_segments: usize,
+        pool_size: u16,
+    ) -> io::Result<Self> {
         let buffer_len = match max_payload.checked_mul(max_gro_segments) {
             Some(len) if len > 0 => len.min(64 * 1024),
             _ => {
@@ -698,21 +717,117 @@ impl EndpointRecvPool {
                 ));
             }
         };
-        let pool =
-            compio::runtime::create_buffer_pool::<BoxAllocator>(RECV_POOL_SIZE, buffer_len, 0)?;
+        let pool = runtime::create_buffer_pool::<BoxAllocator>(pool_size, buffer_len, 0)?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            returned: Arc::new(Event::new()),
+        })
+    }
+}
+
+#[inline]
+fn is_recv_pool_exhausted(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ENOBUFS)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+type RawRecvStream = Pin<Box<dyn Stream<Item = io::Result<RecvMsgMultiResult>>>>;
+
+pub(crate) struct RecvMultiStream {
+    pool: EndpointRecvPool,
+    raw: Option<RawRecvStream>,
+    wait: Option<EventListener>,
+    enobufs_retry: bool,
+    make_inner: Box<dyn FnMut() -> io::Result<RawRecvStream>>,
+}
+
+impl RecvMultiStream {
+    fn new(
+        pool: EndpointRecvPool,
+        make_inner: Box<dyn FnMut() -> io::Result<RawRecvStream>>,
+    ) -> Self {
+        Self {
+            pool,
+            raw: None,
+            wait: None,
+            enobufs_retry: false,
+            make_inner,
+        }
+    }
+}
+
+impl Stream for RecvMultiStream {
+    type Item = io::Result<(RecvMeta, RecvBuffer)>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if let Some(wait) = self.wait.as_mut() {
+                ready!(Pin::new(wait).poll(cx));
+
+                self.wait = None;
+                self.enobufs_retry = false;
+                self.raw = None;
+            }
+
+            let inner = match self.raw.as_mut() {
+                None => {
+                    let raw_recv_stream = (self.make_inner)()?;
+                    self.raw.insert(raw_recv_stream)
+                }
+
+                Some(inner) => inner,
+            };
+
+            match ready!(inner.as_mut().poll_next(cx)) {
+                Some(Ok(msg)) => {
+                    self.enobufs_retry = false;
+                    let returned = self.pool.returned.clone();
+                    return Poll::Ready(Some(RecvBuffer::from_multi(msg, returned)));
+                }
+
+                Some(Err(err)) if is_recv_pool_exhausted(&err) => {
+                    self.raw = None;
+                    if !self.enobufs_retry {
+                        self.enobufs_retry = true;
+                        continue;
+                    }
+
+                    self.enobufs_retry = false;
+                    self.wait = Some(self.pool.returned.listen());
+                    continue;
+                }
+
+                Some(Err(err)) => return Poll::Ready(Some(Err(err))),
+
+                None => self.raw = None,
+            }
+        }
     }
 }
 
 pub(crate) struct RecvBuffer {
-    buffer: BufferRef,
+    buffer: ManuallyDrop<BufferRef>,
     offset: usize,
     len: usize,
+    returned: Arc<Event>,
+}
+
+#[inline]
+fn release_recv_buffer(buffer: BufferRef, returned: &Event) {
+    drop(buffer);
+    returned.notify(1);
 }
 
 impl RecvBuffer {
-    fn from_multi(msg: RecvMsgMultiResult) -> io::Result<(RecvMeta, Self)> {
+    fn from_multi(msg: RecvMsgMultiResult, returned: Arc<Event>) -> io::Result<(RecvMeta, Self)> {
         let data = msg.data();
         let len = data.len();
         let data_ptr = data.as_ptr() as usize;
@@ -728,10 +843,18 @@ impl RecvBuffer {
         let meta = RecvMeta::from_parts(remote, len, msg.ancillary());
         let buffer = msg.into_inner();
         let buffer_ptr = buffer.as_init().as_ptr() as usize;
-        let offset = data_ptr
-            .checked_sub(buffer_ptr)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid payload offset"))?;
+        let offset = match data_ptr.checked_sub(buffer_ptr) {
+            Some(offset) => offset,
+            None => {
+                release_recv_buffer(buffer, &returned);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid payload offset",
+                ));
+            }
+        };
         if offset + len > buffer.as_init().len() {
+            release_recv_buffer(buffer, &returned);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "payload exceeds receive buffer",
@@ -740,11 +863,20 @@ impl RecvBuffer {
         Ok((
             meta,
             Self {
-                buffer,
+                buffer: ManuallyDrop::new(buffer),
                 offset,
                 len,
+                returned,
             },
         ))
+    }
+}
+
+impl Drop for RecvBuffer {
+    fn drop(&mut self) {
+        // Safety: `take` leaves an empty slot that must not be dropped again.
+        let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
+        release_recv_buffer(buffer, &self.returned);
     }
 }
 
@@ -795,7 +927,7 @@ pub(crate) fn spawn_recv_task(sockets: &SocketSet, socket: &Socket) {
         recv_pool = shared.recv_pool.clone();
     }
 
-    compio::runtime::spawn(async move {
+    runtime::spawn(async move {
         let mut recv_stream = socket.recv_multi(&recv_pool);
         loop {
             if stopped.load(Ordering::Relaxed) {
@@ -811,6 +943,7 @@ pub(crate) fn spawn_recv_task(sockets: &SocketSet, socket: &Socket) {
                     break;
                 }
                 None => {
+                    // See `RecvMultiStream`: UDP recv is recreated internally, not terminated.
                     recv_stream = socket.recv_multi(&recv_pool);
                 }
             }
@@ -826,6 +959,7 @@ mod tests {
     use std::os::fd::AsRawFd;
     #[cfg(windows)]
     use std::os::windows::io::AsRawSocket;
+    use std::time::Duration;
 
     use futures_util::StreamExt;
     use socket2::{Domain, Protocol, Socket as Socket2, Type};
@@ -951,6 +1085,102 @@ mod tests {
 
         let expected = (0..PACKETS).map(|i| vec![i as u8; 16]).collect::<Vec<_>>();
         assert_eq!(received, expected);
+    }
+
+    #[compio::test]
+    async fn recv_multi_waits_when_pool_exhausted() {
+        const POOL_SIZE: u16 = 2;
+
+        let passive = Socket::new(UdpSocket::bind("[::1]:0").await.unwrap()).unwrap();
+        let active = Socket::new(UdpSocket::bind("[::1]:0").await.unwrap()).unwrap();
+        let passive_addr = passive.local_addr().unwrap();
+        let recv_pool = EndpointRecvPool::with_pool_size(
+            u16::MAX as usize,
+            passive.max_gro_segments(),
+            POOL_SIZE,
+        )
+        .unwrap();
+
+        for i in 0..4u8 {
+            active
+                .send(
+                    vec![i; 32],
+                    &Transmit {
+                        destination: passive_addr,
+                        ecn: None,
+                        size: 32,
+                        segment_size: None,
+                        src_ip: None,
+                    },
+                )
+                .await;
+        }
+
+        let mut recv_stream = passive.recv_multi(&recv_pool);
+        let (_, b1) = recv_stream.next().await.unwrap().unwrap();
+        let (_, b2) = recv_stream.next().await.unwrap().unwrap();
+
+        let (tx, rx) = flume::bounded(1);
+        runtime::spawn(async move {
+            tx.send_async(recv_stream.next().await).await.ok();
+        })
+        .detach();
+
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "recv should block while pool is full"
+        );
+
+        drop(b1);
+        let third = rx.recv_async().await.unwrap().unwrap().unwrap();
+        assert_eq!(third.1.as_ref(), &[2u8; 32]);
+
+        drop(b2);
+    }
+
+    #[compio::test]
+    async fn release_recv_buffer_notifies_waiter() {
+        const POOL_SIZE: u16 = 1;
+
+        let passive = Socket::new(UdpSocket::bind("[::1]:0").await.unwrap()).unwrap();
+        let active = Socket::new(UdpSocket::bind("[::1]:0").await.unwrap()).unwrap();
+        let recv_pool = EndpointRecvPool::with_pool_size(
+            u16::MAX as usize,
+            passive.max_gro_segments(),
+            POOL_SIZE,
+        )
+        .unwrap();
+
+        active
+            .send(
+                b"x".as_slice(),
+                &Transmit {
+                    destination: passive.local_addr().unwrap(),
+                    ecn: None,
+                    size: 1,
+                    segment_size: None,
+                    src_ip: None,
+                },
+            )
+            .await;
+
+        let mut recv_stream = passive.recv_multi(&recv_pool);
+        let (_, held) = recv_stream.next().await.unwrap().unwrap();
+
+        let returned = recv_pool.returned.clone();
+        let (tx, rx) = flume::bounded(1);
+        runtime::spawn(async move {
+            returned.listen().await;
+            tx.send_async(()).await.ok();
+        })
+        .detach();
+
+        compio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err());
+
+        drop(held);
+        rx.recv_async().await.unwrap();
     }
 
     #[compio::test]
