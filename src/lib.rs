@@ -27,6 +27,7 @@ mod connection;
 mod endpoint;
 mod event_stream;
 mod incoming;
+mod managed_stream;
 mod path;
 mod recv_stream;
 mod send_stream;

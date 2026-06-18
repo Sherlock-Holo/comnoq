@@ -8,13 +8,13 @@
 //! [`quinn-udp`]: https://docs.rs/quinn-udp
 //! [quinn-rs/quinn#1516]: https://github.com/quinn-rs/quinn/pull/1516
 
-use std::mem::ManuallyDrop;
 use std::{
     future::Future,
     io,
     mem::MaybeUninit,
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
+    os::fd::AsFd,
     pin::Pin,
     sync::{Arc, Mutex, atomic::Ordering},
     task::{Context, Poll, ready},
@@ -22,20 +22,20 @@ use std::{
 
 use compio::buf::{BufResult, IntoInner, IoBuf, IoBufMut, SetLen};
 use compio::driver::{
-    BoxAllocator, BufferPool, BufferRef, ToSharedFd,
-    op::{RecvFlags, RecvMsgMulti, RecvMsgMultiResult, ReturnFlags},
+    BoxAllocator, BufferPool, ToSharedFd,
+    op::{RecvFlags, ReturnFlags},
 };
 use compio::io::ancillary::{AncillaryBuilder, AncillaryData, AncillaryIter};
 use compio::net::UdpSocket;
 use compio::runtime;
-use compio::runtime::{Runtime, SubmitMultiStream};
-use event_listener::{Event, EventListener};
+use event_listener::Event;
 use flume::Sender;
 use futures_util::{Stream, StreamExt};
 use noq_proto::{EcnCodepoint, Transmit};
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock;
 
+use crate::managed_stream::{Buffer, ManagedRecvMsg, RecvMsgManagedMultiStream};
 use crate::sync::atomic::AtomicBool;
 
 const CMSG_LEN: usize = 128;
@@ -459,26 +459,17 @@ impl Socket {
         }
     }
 
-    pub fn recv_multi(&self, pool: &EndpointRecvPool) -> RecvMultiStream {
-        let fd = self.inner.to_shared_fd();
-        let ep_pool = pool.clone();
-
-        RecvMultiStream::new(
-            ep_pool.clone(),
-            Box::new(move || {
-                let buffer_pool = ep_pool.pool.clone();
-                let fd = fd.clone();
-
-                Ok(Box::pin(SubmitMultiStream::new(move || {
-                    let op =
-                        RecvMsgMulti::new(fd.clone(), &buffer_pool, CMSG_LEN, RecvFlags::empty())?;
-
-                    Ok(Runtime::current()
-                        .submit_multi(op)
-                        .into_managed_with(buffer_pool.clone(), CMSG_LEN))
-                })))
-            }),
-        )
+    pub fn recv_multi(
+        &self,
+        pool: &EndpointRecvPool,
+    ) -> RecvMultiStream<impl Clone + AsFd + Unpin + 'static> {
+        RecvMultiStream::new(RecvMsgManagedMultiStream::new(
+            self.inner.to_shared_fd(),
+            pool.pool.clone(),
+            pool.returned.clone(),
+            CMSG_LEN,
+            RecvFlags::empty(),
+        ))
     }
 
     fn construct_control_message(&self, transmit: &Transmit) -> io::Result<ControlBuf> {
@@ -726,127 +717,53 @@ impl EndpointRecvPool {
     }
 }
 
-#[inline]
-fn is_recv_pool_exhausted(error: &io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        error.raw_os_error() == Some(libc::ENOBUFS)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = error;
-        false
+pub(crate) struct RecvMultiStream<S> {
+    inner: RecvMsgManagedMultiStream<S>,
+}
+
+impl<S> RecvMultiStream<S> {
+    fn new(inner: RecvMsgManagedMultiStream<S>) -> Self {
+        Self { inner }
     }
 }
 
-type RawRecvStream = Pin<Box<dyn Stream<Item = io::Result<RecvMsgMultiResult>>>>;
-
-pub(crate) struct RecvMultiStream {
-    pool: EndpointRecvPool,
-    raw: Option<RawRecvStream>,
-    wait: Option<EventListener>,
-    enobufs_retry: bool,
-    make_inner: Box<dyn FnMut() -> io::Result<RawRecvStream>>,
-}
-
-impl RecvMultiStream {
-    fn new(
-        pool: EndpointRecvPool,
-        make_inner: Box<dyn FnMut() -> io::Result<RawRecvStream>>,
-    ) -> Self {
-        Self {
-            pool,
-            raw: None,
-            wait: None,
-            enobufs_retry: false,
-            make_inner,
-        }
-    }
-}
-
-impl Stream for RecvMultiStream {
-    type Item = io::Result<(RecvMeta, RecvBuffer)>;
+impl<S: Clone + AsFd + Unpin + 'static> Stream for RecvMultiStream<S> {
+    type Item = io::Result<RecvItem>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            if let Some(wait) = self.wait.as_mut() {
-                ready!(Pin::new(wait).poll(cx));
-
-                self.wait = None;
-                self.enobufs_retry = false;
-                self.raw = None;
-            }
-
-            let inner = match self.raw.as_mut() {
-                None => {
-                    let raw_recv_stream = (self.make_inner)()?;
-                    self.raw.insert(raw_recv_stream)
-                }
-
-                Some(inner) => inner,
-            };
-
-            match ready!(inner.as_mut().poll_next(cx)) {
-                Some(Ok(msg)) => {
-                    self.enobufs_retry = false;
-                    let returned = self.pool.returned.clone();
-                    return Poll::Ready(Some(RecvBuffer::from_multi(msg, returned)));
-                }
-
-                Some(Err(err)) if is_recv_pool_exhausted(&err) => {
-                    self.raw = None;
-                    if !self.enobufs_retry {
-                        self.enobufs_retry = true;
-                        continue;
-                    }
-
-                    self.enobufs_retry = false;
-                    self.wait = Some(self.pool.returned.listen());
-                    continue;
-                }
-
-                Some(Err(err)) => return Poll::Ready(Some(Err(err))),
-
-                None => self.raw = None,
-            }
+        match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+            Some(Ok(msg)) => Poll::Ready(Some(RecvBuffer::from_managed_msg(msg))),
+            Some(Err(err)) => Poll::Ready(Some(Err(err))),
+            None => Poll::Ready(None),
         }
     }
 }
 
 pub(crate) struct RecvBuffer {
-    buffer: ManuallyDrop<BufferRef>,
+    buffer: Buffer,
     offset: usize,
     len: usize,
-    returned: Arc<Event>,
-}
-
-#[inline]
-fn release_recv_buffer(buffer: BufferRef, returned: &Event) {
-    drop(buffer);
-    returned.notify(1);
 }
 
 impl RecvBuffer {
-    fn from_multi(msg: RecvMsgMultiResult, returned: Arc<Event>) -> io::Result<(RecvMeta, Self)> {
+    fn from_managed_msg(msg: ManagedRecvMsg) -> io::Result<RecvItem> {
         let data = msg.data();
         let len = data.len();
         let data_ptr = data.as_ptr() as usize;
         let remote = msg
-            .addr()
-            .and_then(|addr| addr.as_socket())
+            .remote()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing remote address"))?;
+        let meta = RecvMeta::from_parts(remote, len, msg.ancillary());
 
         if msg.flags().contains(ReturnFlags::TRUNC) {
             compio_log::warn!("received truncated UDP datagram");
         }
 
-        let meta = RecvMeta::from_parts(remote, len, msg.ancillary());
-        let buffer = msg.into_inner();
+        let buffer = msg.into_buffer();
         let buffer_ptr = buffer.as_init().as_ptr() as usize;
         let offset = match data_ptr.checked_sub(buffer_ptr) {
             Some(offset) => offset,
             None => {
-                release_recv_buffer(buffer, &returned);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid payload offset",
@@ -854,7 +771,6 @@ impl RecvBuffer {
             }
         };
         if offset + len > buffer.as_init().len() {
-            release_recv_buffer(buffer, &returned);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "payload exceeds receive buffer",
@@ -863,20 +779,11 @@ impl RecvBuffer {
         Ok((
             meta,
             Self {
-                buffer: ManuallyDrop::new(buffer),
+                buffer,
                 offset,
                 len,
-                returned,
             },
         ))
-    }
-}
-
-impl Drop for RecvBuffer {
-    fn drop(&mut self) {
-        // Safety: `take` leaves an empty slot that must not be dropped again.
-        let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
-        release_recv_buffer(buffer, &self.returned);
     }
 }
 
@@ -943,7 +850,8 @@ pub(crate) fn spawn_recv_task(sockets: &SocketSet, socket: &Socket) {
                     break;
                 }
                 None => {
-                    // See `RecvMultiStream`: UDP recv is recreated internally, not terminated.
+                    // RecvMsgManagedMultiStream recreates UDP multishot receives internally,
+                    // so this is only a defensive restart if the stream ever terminates.
                     recv_stream = socket.recv_multi(&recv_pool);
                 }
             }
@@ -961,6 +869,7 @@ mod tests {
     use std::os::windows::io::AsRawSocket;
     use std::time::Duration;
 
+    use compio::runtime::Runtime;
     use futures_util::StreamExt;
     use socket2::{Domain, Protocol, Socket as Socket2, Type};
 
