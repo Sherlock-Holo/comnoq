@@ -794,3 +794,30 @@ fn endpoint_config() -> EndpointConfig {
         crate::crypto_graviola::graviola_endpoint_config()
     }
 }
+
+#[cfg(feature = "graviola")]
+mod seal {
+    use noq_proto::EndpointConfig;
+
+    pub trait EndpointConfigGraviolaExtSealed {}
+
+    impl EndpointConfigGraviolaExtSealed for EndpointConfig {}
+}
+
+#[cfg(feature = "graviola")]
+/// Extension trait for [`EndpointConfig`] when the `graviola` feature is enabled.
+///
+/// Provides a graviola-backed alternative to [`EndpointConfig::default()`], which
+/// uses the `ring` crate when that feature is active.
+pub trait EndpointConfigGraviolaExt: seal::EndpointConfigGraviolaExtSealed {
+    /// Create a default [`EndpointConfig`] with a randomized reset key using
+    /// graviola HMAC-SHA256.
+    fn default_graviola_endpoint_config() -> EndpointConfig;
+}
+
+#[cfg(feature = "graviola")]
+impl EndpointConfigGraviolaExt for EndpointConfig {
+    fn default_graviola_endpoint_config() -> EndpointConfig {
+        crate::crypto_graviola::graviola_endpoint_config()
+    }
+}
