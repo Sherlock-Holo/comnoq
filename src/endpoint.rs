@@ -840,8 +840,8 @@ pub trait ServerConfigGraviolaExt: seal::ServerConfigGraviolaExtSealed {
     /// Create a [`ServerConfig`] from a single certificate chain and private key,
     /// using graviola for handshake token encryption.
     fn with_graviola_single_cert(
-        cert_chain: Vec<CertificateDer<'static>>,
-        key: PrivateKeyDer<'static>,
+        cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
     ) -> Result<ServerConfig, rustls::Error>;
 }
 
@@ -852,11 +852,10 @@ impl ServerConfigGraviolaExt for ServerConfig {
     }
 
     fn with_graviola_single_cert(
-        cert_chain: Vec<CertificateDer<'static>>,
-        key: PrivateKeyDer<'static>,
+        cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
     ) -> Result<Self, rustls::Error> {
         use noq_proto::crypto::rustls::QuicServerConfig;
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
         let tls_server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
