@@ -20,13 +20,11 @@ use compio::runtime::JoinHandle;
 use compio_log::{Instrument, error};
 use flume::{Receiver, Sender, unbounded};
 use futures_util::{FutureExt, StreamExt, future::FusedFuture, select, task::AtomicWaker};
-use noq_proto::crypto::rustls::QuicServerConfig;
 use noq_proto::{
     ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointConfig,
     EndpointEvent, FourTuple, NetworkChangeHint, ServerConfig, Transmit, VarInt,
 };
 use rustc_hash::FxHashMap as HashMap;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::{
     Connecting, ConnectionEvent, IO_LOOP_BOUND, Incoming, RECV_TIME_BOUND, RecvMeta,
@@ -857,6 +855,9 @@ impl ServerConfigGraviolaExt for ServerConfig {
         cert_chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self, rustls::Error> {
+        use noq_proto::crypto::rustls::QuicServerConfig;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
         let tls_server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)?;

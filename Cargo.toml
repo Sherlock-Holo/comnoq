@@ -1,6 +1,6 @@
 [package]
 name = "comnoq"
-version = "0.3.4"
+version = "0.3.5"
 description = "QUIC for compio with noq backend"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "net", "quic"]
