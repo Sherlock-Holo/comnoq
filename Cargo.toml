@@ -1,6 +1,6 @@
 [package]
 name = "comnoq"
-version = "0.3.1"
+version = "0.3.2"
 description = "QUIC for compio with noq backend"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "net", "quic"]
@@ -17,8 +17,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 compio-log = "0.2.0"
 noq-proto = { version = "1.0.0", default-features = false }
 rustls = { version = "0.23.40", default-features = false, features = ["std"] }
-rustls-graviola = { version = "0.3", optional = true }
-graviola = { version = "0.3.4", optional = true }
+rustls-graviola = { version = "0.4.0", optional = true }
+graviola = { version = "0.4.0", optional = true }
 rustls-platform-verifier = { version = "0.7.0", optional = true }
 rustls-native-certs = { version = "0.8.4", optional = true }
 webpki-roots = { version = "1.0.7", optional = true }
@@ -36,7 +36,7 @@ event-listener = "5.4.1"
 rand = { version = "0.10.1", optional = true }
 
 [dependencies.compio]
-version = "0.19.0"
+version = "0.19.1"
 features = [
     "bytes",
     "bytemuck",
