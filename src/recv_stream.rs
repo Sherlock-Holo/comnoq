@@ -1,4 +1,5 @@
 use std::{
+    future::poll_fn,
     io,
     mem::MaybeUninit,
     task::{Context, Poll},
@@ -6,7 +7,6 @@ use std::{
 
 use compio::buf::{BufResult, IoBufMut, bytes::Bytes};
 use compio::io::AsyncRead;
-use futures_util::future::poll_fn;
 use noq_proto::{Chunk, Chunks, ClosedStream, ReadableError, StreamId, VarInt};
 use thiserror::Error;
 
@@ -586,6 +586,7 @@ mod compat {
     use std::{
         ops::{Deref, DerefMut},
         pin::Pin,
+        slice,
         task::ready,
     };
 
@@ -672,7 +673,7 @@ mod compat {
             // SAFETY: buf is valid
             self.get_mut()
                 .poll_read_uninit(cx, unsafe {
-                    std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len())
+                    slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len())
                 })
                 .map_err(Into::into)
         }
