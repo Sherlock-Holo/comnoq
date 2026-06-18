@@ -1,11 +1,11 @@
 use std::{
+    future::poll_fn,
     io,
     task::{Context, Poll},
 };
 
 use compio::buf::{BufResult, IoBuf, bytes::Bytes};
 use compio::io::AsyncWrite;
-use futures_util::future::poll_fn;
 use noq_proto::{ClosedStream, FinishError, StreamId, VarInt};
 use thiserror::Error;
 
@@ -337,6 +337,7 @@ impl AsyncWrite for SendStream {
             poll_fn(|cx| self.execute_poll_write(cx, |mut stream| stream.write(buf.as_init())))
                 .await
                 .map_err(Into::into);
+
         BufResult(res, buf)
     }
 

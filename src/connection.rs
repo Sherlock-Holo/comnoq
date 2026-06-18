@@ -5,6 +5,7 @@ use std::sync::Weak as WeakShared;
 use std::{
     collections::VecDeque,
     fmt::Debug,
+    future::poll_fn,
     io,
     net::{IpAddr, SocketAddr, SocketAddrV6},
     pin::{Pin, pin},
@@ -20,7 +21,7 @@ use compio_log::Instrument;
 use flume::{Receiver, Sender};
 use futures_util::{
     FutureExt, StreamExt,
-    future::{self, Fuse, FusedFuture, LocalBoxFuture},
+    future::{Fuse, FusedFuture, LocalBoxFuture},
     select, stream,
 };
 #[cfg(rustls)]
@@ -761,7 +762,7 @@ impl Connecting {
     /// Parameters negotiated during the handshake.
     #[cfg(rustls)]
     pub async fn handshake_data(&mut self) -> Result<Box<HandshakeData>, ConnectionError> {
-        future::poll_fn(|cx| {
+        poll_fn(|cx| {
             let mut state = self.0.try_state()?;
             if let Some(data) = state.handshake_data() {
                 return Poll::Ready(Ok(data));
@@ -1046,7 +1047,7 @@ impl Connection {
     /// At this point, the server has either accepted our authentication,
     /// or, if client authentication is not required, accepted our lack of authentication.
     pub async fn handshake_confirmed(&self) -> Result<(), ConnectionError> {
-        future::poll_fn(|cx| {
+        poll_fn(|cx| {
             let mut state = self.0.try_state()?;
             if state.handshake_confirmed {
                 return Poll::Ready(Ok(()));
@@ -1294,12 +1295,24 @@ impl Connection {
         Ok(addresses)
     }
 
-    fn poll_recv_datagram(&self, cx: &mut Context) -> Poll<Result<Bytes, ConnectionError>> {
+    /// Poll for an application datagram.
+    ///
+    /// Returns [`Poll::Pending`] if no datagram is currently available, after
+    /// registering `cx`'s waker to be notified when one arrives.
+    ///
+    /// See [`read_datagram()`] for an async wrapper and [`try_recv_datagram()`]
+    /// for a non-blocking alternative.
+    ///
+    /// [`read_datagram()`]: Connection::read_datagram
+    /// [`try_recv_datagram()`]: Connection::try_recv_datagram
+    pub fn poll_recv_datagram(&self, cx: &mut Context) -> Poll<Result<Bytes, ConnectionError>> {
         let mut state = self.0.try_state()?;
         if let Some(bytes) = state.conn.datagrams().recv() {
             return Poll::Ready(Ok(bytes));
         }
+
         push_waker_dedup(&mut state.datagram_received, cx.waker());
+
         Poll::Pending
     }
 
@@ -1312,7 +1325,7 @@ impl Connection {
 
     /// Receive an application datagram.
     pub async fn read_datagram(&self) -> Result<Bytes, ConnectionError> {
-        future::poll_fn(|cx| self.poll_recv_datagram(cx)).await
+        poll_fn(|cx| self.poll_recv_datagram(cx)).await
     }
 
     fn try_send_datagram(
@@ -1360,7 +1373,7 @@ impl Connection {
     /// [`send_datagram()`]: Connection::send_datagram
     pub async fn send_datagram_wait(&self, data: Bytes) -> Result<(), SendDatagramError> {
         let mut data = Some(data);
-        future::poll_fn(
+        poll_fn(
             |cx| match self.try_send_datagram(Some(cx), data.take().unwrap()) {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(Ok(e)) => Poll::Ready(Err(e)),
@@ -1408,8 +1421,7 @@ impl Connection {
 
     /// Initiate a new outgoing unidirectional stream.
     pub async fn open_uni(&self) -> Result<SendStream, ConnectionError> {
-        let (stream, is_0rtt) =
-            future::poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Uni)).await?;
+        let (stream, is_0rtt) = poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Uni)).await?;
         Ok(SendStream::new(self.0.clone(), stream, is_0rtt))
     }
 
@@ -1430,8 +1442,7 @@ impl Connection {
 
     /// Initiate a new outgoing bidirectional stream.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        let (stream, is_0rtt) =
-            future::poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Bi)).await?;
+        let (stream, is_0rtt) = poll_fn(|cx| self.poll_open_stream(Some(cx), Dir::Bi)).await?;
         Ok((
             SendStream::new(self.0.clone(), stream, is_0rtt),
             RecvStream::new(self.0.clone(), stream, is_0rtt),
@@ -1455,7 +1466,7 @@ impl Connection {
 
     /// Accept the next incoming uni-directional stream
     pub async fn accept_uni(&self) -> Result<RecvStream, ConnectionError> {
-        let (stream, is_0rtt) = future::poll_fn(|cx| self.poll_accept_stream(cx, Dir::Uni)).await?;
+        let (stream, is_0rtt) = poll_fn(|cx| self.poll_accept_stream(cx, Dir::Uni)).await?;
         Ok(RecvStream::new(self.0.clone(), stream, is_0rtt))
     }
 
@@ -1471,7 +1482,7 @@ impl Connection {
     /// [`SendStream`]: SendStream
     /// [`RecvStream`]: RecvStream
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        let (stream, is_0rtt) = future::poll_fn(|cx| self.poll_accept_stream(cx, Dir::Bi)).await?;
+        let (stream, is_0rtt) = poll_fn(|cx| self.poll_accept_stream(cx, Dir::Bi)).await?;
         Ok((
             SendStream::new(self.0.clone(), stream, is_0rtt),
             RecvStream::new(self.0.clone(), stream, is_0rtt),
