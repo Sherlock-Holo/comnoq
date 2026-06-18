@@ -129,8 +129,15 @@ impl<S: Clone + AsFd + Unpin + 'static> RecvMsgManagedMultiStream<S> {
     }
 
     fn wait_for_buffer(&mut self) {
+        let had_raw = self.raw.is_some();
+        let wait = self.returned.listen();
         self.raw = None;
-        self.wait = Some(self.returned.listen());
+        if had_raw {
+            // Dropping the raw stream can return compio-owned buffers, which do not
+            // pass through `Buffer::drop`.
+            self.returned.notify(1);
+        }
+        self.wait = Some(wait);
     }
 }
 
