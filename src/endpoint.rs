@@ -372,7 +372,7 @@ impl EndpointInner {
                 items = recv_stream.select_next_some() => {
                     let mut state = self.state.lock();
                     for (meta, buf) in items {
-                        state.handle_data(meta, &buf, respond_fn);
+                        state.handle_data(meta, buf.as_ref(), respond_fn);
                     }
                     state
                 },

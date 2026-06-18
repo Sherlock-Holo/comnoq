@@ -887,7 +887,7 @@ impl AsRef<[u8]> for RecvBuffer {
     }
 }
 
-pub(crate) type RecvItem = (RecvMeta, Vec<u8>);
+pub(crate) type RecvItem = (RecvMeta, RecvBuffer);
 
 pub(crate) struct SharedSocketState {
     pub sockets: Vec<SocketEntry>,
@@ -935,7 +935,7 @@ pub(crate) fn spawn_recv_task(sockets: &SocketSet, socket: &Socket) {
             }
             match recv_stream.next().await {
                 Some(Ok((meta, buf))) => {
-                    recv_tx.send_async((meta, buf.as_ref().to_vec())).await.ok();
+                    recv_tx.send_async((meta, buf)).await.ok();
                 }
                 Some(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => continue,
                 Some(Err(_e)) => {
