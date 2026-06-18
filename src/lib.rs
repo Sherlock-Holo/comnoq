@@ -43,9 +43,9 @@ pub use connection::{
     Closed, Connecting, Connection, ConnectionError, OnClosed, OpenStreamError, SendDatagramError,
     WeakConnectionHandle, ZeroRttAccepted,
 };
-#[cfg(feature = "graviola")]
-pub use endpoint::EndpointConfigGraviolaExt;
 pub use endpoint::{Accept, Endpoint, EndpointStats};
+#[cfg(feature = "graviola")]
+pub use endpoint::{EndpointConfigGraviolaExt, ServerConfigGraviolaExt};
 pub use event_stream::{Lagged, NatTraversalUpdates, ObservedExternalAddr, PathEvents};
 pub use incoming::{Incoming, IncomingFuture};
 pub use path::{AddressDiscovery, OpenPath, Path, WeakPathHandle};

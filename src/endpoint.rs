@@ -20,11 +20,13 @@ use compio::runtime::JoinHandle;
 use compio_log::{Instrument, error};
 use flume::{Receiver, Sender, unbounded};
 use futures_util::{FutureExt, StreamExt, future::FusedFuture, select, task::AtomicWaker};
+use noq_proto::crypto::rustls::QuicServerConfig;
 use noq_proto::{
     ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent, EndpointConfig,
     EndpointEvent, FourTuple, NetworkChangeHint, ServerConfig, Transmit, VarInt,
 };
 use rustc_hash::FxHashMap as HashMap;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::{
     Connecting, ConnectionEvent, IO_LOOP_BOUND, Incoming, RECV_TIME_BOUND, RecvMeta,
@@ -797,11 +799,15 @@ fn endpoint_config() -> EndpointConfig {
 
 #[cfg(feature = "graviola")]
 mod seal {
-    use noq_proto::EndpointConfig;
+    use noq_proto::{EndpointConfig, ServerConfig};
 
     pub trait EndpointConfigGraviolaExtSealed {}
 
     impl EndpointConfigGraviolaExtSealed for EndpointConfig {}
+
+    pub trait ServerConfigGraviolaExtSealed {}
+
+    impl ServerConfigGraviolaExtSealed for ServerConfig {}
 }
 
 #[cfg(feature = "graviola")]
@@ -819,5 +825,45 @@ pub trait EndpointConfigGraviolaExt: seal::EndpointConfigGraviolaExtSealed {
 impl EndpointConfigGraviolaExt for EndpointConfig {
     fn default_graviola_endpoint_config() -> EndpointConfig {
         crate::crypto_graviola::graviola_endpoint_config()
+    }
+}
+
+#[cfg(feature = "graviola")]
+/// Extension trait for [`ServerConfig`] when the `graviola` feature is enabled.
+///
+/// Provides graviola-backed alternatives to [`ServerConfig::with_crypto()`] and
+/// [`ServerConfig::with_single_cert()`], which use the `ring` crate when that
+/// feature is active.
+pub trait ServerConfigGraviolaExt: seal::ServerConfigGraviolaExtSealed {
+    /// Create a [`ServerConfig`] from a QUIC/TLS crypto configuration and a
+    /// randomized handshake token key using graviola.
+    fn with_graviola_crypto(crypto: Arc<dyn noq_proto::crypto::ServerConfig>) -> ServerConfig;
+
+    /// Create a [`ServerConfig`] from a single certificate chain and private key,
+    /// using graviola for handshake token encryption.
+    fn with_graviola_single_cert(
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<ServerConfig, rustls::Error>;
+}
+
+#[cfg(feature = "graviola")]
+impl ServerConfigGraviolaExt for ServerConfig {
+    fn with_graviola_crypto(crypto: Arc<dyn noq_proto::crypto::ServerConfig>) -> Self {
+        crate::crypto_graviola::graviola_server_with_crypto(crypto)
+    }
+
+    fn with_graviola_single_cert(
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Self, rustls::Error> {
+        let tls_server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)?;
+
+        let quic_server_config = QuicServerConfig::try_from(tls_server_config)
+            .map_err(|err| rustls::Error::General(err.to_string()))?;
+
+        Ok(Self::with_graviola_crypto(Arc::new(quic_server_config)))
     }
 }
