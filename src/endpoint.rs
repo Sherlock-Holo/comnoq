@@ -785,11 +785,11 @@ impl Future for Accept<'_> {
 
 #[cfg(rustls)]
 fn endpoint_config() -> EndpointConfig {
-    #[cfg(feature = "ring")]
+    #[cfg(all(feature = "ring", not(feature = "graviola")))]
     {
         EndpointConfig::default()
     }
-    #[cfg(all(feature = "graviola", not(feature = "ring")))]
+    #[cfg(feature = "graviola")]
     {
         crate::crypto_graviola::graviola_endpoint_config()
     }

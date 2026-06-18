@@ -227,11 +227,11 @@ impl ServerBuilder<rustls::ServerConfig> {
         let crypto = Arc::new(
             QuicServerConfig::try_from(self.0).expect("should support TLS13_AES_128_GCM_SHA256"),
         );
-        #[cfg(feature = "ring")]
+        #[cfg(all(feature = "ring", not(feature = "graviola")))]
         {
             ServerConfig::with_crypto(crypto)
         }
-        #[cfg(all(feature = "graviola", not(feature = "ring")))]
+        #[cfg(feature = "graviola")]
         {
             crate::crypto_graviola::graviola_server_with_crypto(crypto)
         }
