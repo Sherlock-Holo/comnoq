@@ -576,7 +576,7 @@ impl Endpoint {
     pub async fn client(addr: impl ToSocketAddrsAsync) -> io::Result<Endpoint> {
         // TODO: try to enable dual-stack on all platforms, notably Windows
         let socket = UdpSocket::bind(addr).await?;
-        Self::new(socket, endpoint_config(), None, None)
+        Self::new(socket, EndpointConfig::default(), None, None)
     }
 
     /// Helper to construct an endpoint for use with both incoming and outgoing
@@ -590,7 +590,7 @@ impl Endpoint {
     #[cfg(rustls)]
     pub async fn server(addr: impl ToSocketAddrsAsync, config: ServerConfig) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
-        Self::new(socket, endpoint_config(), Some(config), None)
+        Self::new(socket, EndpointConfig::default(), Some(config), None)
     }
 
     /// Returns relevant stats from this Endpoint
@@ -780,90 +780,5 @@ impl Future for Accept<'_> {
             .map(|incoming| {
                 incoming.map(|incoming| Incoming::new(incoming, self.endpoint.inner.clone()))
             })
-    }
-}
-
-#[cfg(rustls)]
-fn endpoint_config() -> EndpointConfig {
-    #[cfg(all(feature = "ring", not(feature = "graviola")))]
-    {
-        EndpointConfig::default()
-    }
-    #[cfg(feature = "graviola")]
-    {
-        crate::crypto_graviola::graviola_endpoint_config()
-    }
-}
-
-#[cfg(feature = "graviola")]
-mod seal {
-    use noq_proto::{EndpointConfig, ServerConfig};
-
-    pub trait EndpointConfigGraviolaExtSealed {}
-
-    impl EndpointConfigGraviolaExtSealed for EndpointConfig {}
-
-    pub trait ServerConfigGraviolaExtSealed {}
-
-    impl ServerConfigGraviolaExtSealed for ServerConfig {}
-}
-
-#[cfg(feature = "graviola")]
-/// Extension trait for [`EndpointConfig`] when the `graviola` feature is enabled.
-///
-/// Provides a graviola-backed alternative to [`EndpointConfig::default()`], which
-/// uses the `ring` crate when that feature is active.
-pub trait EndpointConfigGraviolaExt: seal::EndpointConfigGraviolaExtSealed {
-    /// Create a default [`EndpointConfig`] with a randomized reset key using
-    /// graviola HMAC-SHA256.
-    fn default_graviola_endpoint_config() -> EndpointConfig;
-}
-
-#[cfg(feature = "graviola")]
-impl EndpointConfigGraviolaExt for EndpointConfig {
-    fn default_graviola_endpoint_config() -> EndpointConfig {
-        crate::crypto_graviola::graviola_endpoint_config()
-    }
-}
-
-#[cfg(feature = "graviola")]
-/// Extension trait for [`ServerConfig`] when the `graviola` feature is enabled.
-///
-/// Provides graviola-backed alternatives to [`ServerConfig::with_crypto()`] and
-/// [`ServerConfig::with_single_cert()`], which use the `ring` crate when that
-/// feature is active.
-pub trait ServerConfigGraviolaExt: seal::ServerConfigGraviolaExtSealed {
-    /// Create a [`ServerConfig`] from a QUIC/TLS crypto configuration and a
-    /// randomized handshake token key using graviola.
-    fn with_graviola_crypto(crypto: Arc<dyn noq_proto::crypto::ServerConfig>) -> ServerConfig;
-
-    /// Create a [`ServerConfig`] from a single certificate chain and private key,
-    /// using graviola for handshake token encryption.
-    fn with_graviola_single_cert(
-        cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
-        key: rustls::pki_types::PrivateKeyDer<'static>,
-    ) -> Result<ServerConfig, rustls::Error>;
-}
-
-#[cfg(feature = "graviola")]
-impl ServerConfigGraviolaExt for ServerConfig {
-    fn with_graviola_crypto(crypto: Arc<dyn noq_proto::crypto::ServerConfig>) -> Self {
-        crate::crypto_graviola::graviola_server_with_crypto(crypto)
-    }
-
-    fn with_graviola_single_cert(
-        cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
-        key: rustls::pki_types::PrivateKeyDer<'static>,
-    ) -> Result<Self, rustls::Error> {
-        use noq_proto::crypto::rustls::QuicServerConfig;
-
-        let tls_server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)?;
-
-        let quic_server_config = QuicServerConfig::try_from(tls_server_config)
-            .map_err(|err| rustls::Error::General(err.to_string()))?;
-
-        Ok(Self::with_graviola_crypto(Arc::new(quic_server_config)))
     }
 }

@@ -26,8 +26,6 @@ pub use noq_proto::{
 #[cfg(rustls)]
 mod builder;
 mod connection;
-#[cfg(feature = "graviola")]
-pub(crate) mod crypto_graviola;
 mod endpoint;
 mod event_stream;
 mod incoming;
@@ -44,8 +42,6 @@ pub use connection::{
     WeakConnectionHandle, ZeroRttAccepted,
 };
 pub use endpoint::{Accept, Endpoint, EndpointStats};
-#[cfg(feature = "graviola")]
-pub use endpoint::{EndpointConfigGraviolaExt, ServerConfigGraviolaExt};
 pub use event_stream::{Lagged, NatTraversalUpdates, ObservedExternalAddr, PathEvents};
 pub use incoming::{Incoming, IncomingFuture};
 pub use path::{AddressDiscovery, OpenPath, Path, WeakPathHandle};

@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "comnoq"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-broadcast",
  "cfg_aliases",
@@ -304,7 +304,6 @@ dependencies = [
  "event-listener",
  "flume",
  "futures-util",
- "graviola",
  "h3",
  "h3-datagram",
  "http",
@@ -316,7 +315,6 @@ dependencies = [
  "rcgen",
  "rustc-hash",
  "rustls",
- "rustls-graviola",
  "rustls-native-certs",
  "rustls-platform-verifier 0.7.0",
  "socket2",
@@ -1049,16 +1047,6 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
-]
-
-[[package]]
-name = "graviola"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a357d69e628911b4c2cfce86c4cd15e2870a8e0f7c40a7fef14c89c64b6d09dc"
-dependencies = [
- "cfg-if",
- "getrandom 0.3.4",
 ]
 
 [[package]]
@@ -1982,16 +1970,6 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-graviola"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf5d0a370be690f7f1aa4e1b912fde3f5f9a5c53285062fd2d6ac1a52ab3e883"
-dependencies = [
- "graviola",
- "rustls",
 ]
 
 [[package]]
