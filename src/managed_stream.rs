@@ -171,7 +171,18 @@ impl<S: Clone + AsFd + Unpin + 'static> Stream for RecvMsgManagedMultiStream<S> 
                 }
 
                 Some(Err(err)) => return Poll::Ready(Some(Err(err))),
-                None => self.raw = None,
+
+                None => {
+                    // The multishot operation terminated without error.
+                    // This happens when the kernel stops a multishot for benign reasons
+                    // (resource management), or when receiving a zero-length UDP datagram
+                    // — the kernel treats ret=0 as termination regardless of protocol.
+                    // The datagram itself (even empty) was already yielded as
+                    // Some(Ok(msg)) above (RecvMsgMultiResult::is_empty() is always
+                    // false). The socket is still alive, so re-create the raw stream.
+                    compio_log::debug!("multishot recv terminated, re-creating raw stream");
+                    self.raw = None;
+                }
             }
         }
     }
