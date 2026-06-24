@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
@@ -69,17 +70,8 @@ impl IoBuf for Buffer {
     }
 }
 
-#[inline]
-fn is_pool_exhausted(error: &io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        error.raw_os_error() == Some(libc::ENOBUFS)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = error;
-        false
-    }
+fn is_pool_exhausted(err: &io::Error) -> bool {
+    err.kind() == ErrorKind::ResourceBusy
 }
 
 type RawRecvMsgStream = Pin<Box<dyn Stream<Item = io::Result<RecvMsgMultiResult>>>>;

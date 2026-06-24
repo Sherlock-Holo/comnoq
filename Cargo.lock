@@ -323,7 +323,7 @@ dependencies = [
 [[package]]
 name = "compio"
 version = "0.19.1"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "compio-buf",
  "compio-dispatcher",
@@ -340,7 +340,7 @@ dependencies = [
 [[package]]
 name = "compio-buf"
 version = "0.8.3"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -350,7 +350,7 @@ dependencies = [
 [[package]]
 name = "compio-dispatcher"
 version = "0.11.0"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "compio-driver",
  "compio-runtime",
@@ -361,7 +361,7 @@ dependencies = [
 [[package]]
 name = "compio-driver"
 version = "0.12.3"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "bitflags",
  "cfg_aliases",
@@ -389,7 +389,7 @@ dependencies = [
 [[package]]
 name = "compio-executor"
 version = "0.1.2"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "compio-log 0.2.0 (git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool)",
  "compio-send-wrapper",
@@ -401,7 +401,7 @@ dependencies = [
 [[package]]
 name = "compio-fs"
 version = "0.12.0"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "cfg_aliases",
  "compio-buf",
@@ -419,7 +419,7 @@ dependencies = [
 [[package]]
 name = "compio-io"
 version = "0.10.1"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "bytemuck",
  "compio-buf",
@@ -444,7 +444,7 @@ dependencies = [
 [[package]]
 name = "compio-log"
 version = "0.2.0"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "tracing",
 ]
@@ -452,7 +452,7 @@ dependencies = [
 [[package]]
 name = "compio-macros"
 version = "0.2.0"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "darling",
  "proc-macro-crate",
@@ -464,7 +464,7 @@ dependencies = [
 [[package]]
 name = "compio-net"
 version = "0.12.1"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "compio-buf",
  "compio-driver",
@@ -484,7 +484,7 @@ dependencies = [
 [[package]]
 name = "compio-quic"
 version = "0.8.0"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "cfg_aliases",
  "compio-buf",
@@ -506,7 +506,7 @@ dependencies = [
 [[package]]
 name = "compio-runtime"
 version = "0.12.2"
-source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#d34156a7a24ae680f3266236ee2e2eba1285ea03"
+source = "git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool#1eedc89961d0a2c50e34aadb3af95b9a8afe6e51"
 dependencies = [
  "compio-buf",
  "compio-driver",
@@ -514,7 +514,6 @@ dependencies = [
  "compio-io",
  "compio-log 0.2.0 (git+https://github.com/Sherlock-Holo/compio.git?branch=multi-buffer-pool)",
  "compio-send-wrapper",
- "core_affinity",
  "criterion",
  "futures-util",
  "libc",
@@ -567,17 +566,6 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
-
-[[package]]
-name = "core_affinity"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a034b3a7b624016c6e13f5df875747cc25f884156aad2abd12b6c46797971342"
-dependencies = [
- "libc",
- "num_cpus",
- "winapi",
-]
 
 [[package]]
 name = "cpufeatures"
@@ -1475,16 +1463,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi",
- "libc",
 ]
 
 [[package]]
