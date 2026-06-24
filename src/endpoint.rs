@@ -27,10 +27,9 @@ use noq_proto::{
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
-    Connecting, ConnectionEvent, IO_LOOP_BOUND, Incoming, RECV_TIME_BOUND, RecvMeta,
-    SharedSocketState, Socket, SocketEntry, SocketSet, select_socket, spawn_recv_task,
+    Connecting, ConnectionEvent, IO_LOOP_BOUND, Incoming, RecvMeta, SharedSocketState, Socket,
+    SocketEntry, SocketSet, select_socket, spawn_recv_task,
     sync::{atomic::AtomicBool, mutex_blocking::Mutex, shared::Shared},
-    work_limiter::WorkLimiter,
 };
 
 #[derive(Debug)]
@@ -369,7 +368,6 @@ impl EndpointInner {
         let mut recv_stream = self.recv_rx.stream().ready_chunks(IO_LOOP_BOUND);
         let mut event_stream = self.events.1.stream().ready_chunks(IO_LOOP_BOUND);
         let mut rebind_stream = self.rebind.1.stream();
-        let mut recv_limiter = WorkLimiter::new(RECV_TIME_BOUND);
 
         loop {
             let mut state = select! {
@@ -394,13 +392,9 @@ impl EndpointInner {
                 },
                 items = recv_stream.select_next_some() => {
                     let mut state = self.state.lock();
-                    recv_limiter.start_cycle(Instant::now);
                     for (meta, buf) in items {
-                        let _ = recv_limiter.allow_work(Instant::now);
-                        let processed = state.handle_data(meta, &buf, respond_fn);
-                        recv_limiter.record_work(processed);
+                        state.handle_data(meta, &buf, respond_fn);
                     }
-                    recv_limiter.finish_cycle(Instant::now);
                     state
                 },
                 events = event_stream.select_next_some() => {
