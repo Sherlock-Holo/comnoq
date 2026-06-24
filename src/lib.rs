@@ -7,8 +7,6 @@
 #![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-use std::time::Duration;
-
 #[cfg(feature = "qlog")]
 pub use noq_proto::QlogConfig;
 pub use noq_proto::{
@@ -33,7 +31,6 @@ mod path;
 mod recv_stream;
 mod send_stream;
 mod socket;
-mod work_limiter;
 
 #[cfg(rustls)]
 pub use builder::{ClientBuilder, ServerBuilder};
@@ -60,9 +57,6 @@ pub(crate) use crate::{
 
 /// Maximum number of datagrams/events processed before yielding to other work.
 const IO_LOOP_BOUND: usize = 160;
-
-/// Maximum time spent receiving UDP datagrams in a single endpoint cycle.
-const RECV_TIME_BOUND: Duration = Duration::from_micros(50);
 
 /// HTTP/3 support via [`h3`].
 #[cfg(feature = "h3")]
